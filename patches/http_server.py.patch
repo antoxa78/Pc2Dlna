@@ -1,5 +1,5 @@
---- a/http_server.py
-+++ b/http_server.py
+--- a/http_server.py	2026-09-20 17:50:55.168417411 +0300
++++ b/http_server.py	2026-09-20 18:35:08.866163867 +0300
 @@ -13,6 +13,21 @@
  
  logger = logging.getLogger('http')
@@ -22,7 +22,22 @@
  # A stream with a throughput of 1 Mbps sends 2048 bytes every 15.6 msecs.
  HTTP_CHUNK_SIZE = 2048
  
-@@ -147,9 +162,11 @@
+@@ -72,7 +87,13 @@
+             # Write the last chunk.
+             if not writer.is_closing():
+                 writer.write('0\r\n\r\n'.encode())
+-            await writer.drain()
++            # local patch: the renderer may already have reset the connection
++            # (frequent with the DR70); draining then raises ConnectionReset,
++            # which is just teardown noise, not a failure to report.
++            try:
++                await writer.drain()
++            except ConnectionError:
++                pass
+             try:
+                 writer.close()
+                 await writer.wait_closed()
+@@ -147,9 +168,11 @@
                                                    name='shutdown')
          except ConnectionError as e:
              logger.error(f'{self.task_name} HTTP socket is closed: {e!r}')
@@ -37,7 +52,7 @@
          except Exception:
              await self.session.close_session(shutdown_coro=True)
              raise
-@@ -294,7 +311,35 @@
+@@ -294,7 +317,35 @@
          exit_status = ret if ret >= 0 else signal.strsignal(-ret)
          logger.info(f'Exit status of parec process: {exit_status}')
          if exit_status in (0, 'Killed', 'Terminated'):
@@ -73,7 +88,7 @@
              return
  
          await self.close(disable=True)
-@@ -386,8 +431,80 @@
+@@ -386,8 +437,100 @@
          self.track = None
          self.track_count = 0
          self.stream_tasks = AsyncioTasks()
@@ -96,6 +111,11 @@
 +            nullsink = renderer.nullsink
 +            if nullsink is None or nullsink.sink_input is None:
 +                return          # playback ended in the meantime
++            if renderer.sink_corked:
++                # local patch: the source is paused (corked); keep the
++                # renderer silent instead of streaming digital silence. The
++                # cork-resume path resumes it on the next app resume.
++                return
 +            try:
 +                await renderer.handle_action(
 +                            renderer.sink_input_meta(nullsink.sink_input))
@@ -131,6 +151,12 @@
 +                    f' keeping pipeline warm for {STREAM_LINGER_SECS}s')
 +        self.linger_task = self.stream_tasks.create_task(self._linger(),
 +                                                         name='stream-linger')
++        # NOTE: do NOT schedule an immediate restart here. Right after a
++        # drop (typically during a long pause) the DR70 is busy tearing down
++        # and rejecting every pull for several seconds; an aggressive retry
++        # cadence (every ~8s) kept it wedged in a play-6s/drop loop. The
++        # _linger() teardown schedules the single restart after the 15s
++        # settle window, which the renderer accepts.
 +
 +    async def _linger(self):
 +        try:
@@ -145,6 +171,15 @@
 +        # Clear the reference before tearing down so that close_session()
 +        # does not cancel this very task.
 +        self.linger_task = None
++        # local patch: restore the stream if the source is still playing.
++        # The renderer dropped the pull and never re-pulled, and without a
++        # subsequent pulse event nothing would re-establish the stream,
++        # leaving the renderer silent (no sound) even though the source
++        # keeps playing. Queue the restart as a detached task BEFORE the
++        # teardown below, so teardown cannot cancel it; schedule_restart()
++        # restarts after PAREC_RESTART_DELAY and is a no-op if playback
++        # ended or the renderer pulled again meanwhile.
++        self.schedule_restart(self.renderer)
 +        # close_session() may cancel the tasks of this session, including
 +        # this one: shield the teardown so it always runs to completion.
 +        await asyncio.shield(self.close_session(shutdown_coro=True))
@@ -154,7 +189,7 @@
          self.is_playing = False
          if self.track is not None:
              try:
-@@ -398,6 +515,7 @@
+@@ -398,6 +541,7 @@
              await self.processes.close_encoder()
  
      async def close_session(self, shutdown_coro=False):
@@ -162,7 +197,7 @@
          self.is_playing = False
          self.track_count = 0
          if self.track is not None:
-@@ -413,7 +531,8 @@
+@@ -413,6 +557,7 @@
              self.processes = None
  
      async def start_track(self, writer):
@@ -170,4 +205,3 @@
          self.is_playing = True
          # Start the subprocesses.
          if self.processes is None:
-             self.processes = StreamProcesses(self)

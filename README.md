@@ -189,6 +189,73 @@ pactl set-default-sink "CelCast-uuid:85f70b2d-3c72-501f-a172-07bbc058d793"
    `maybe_stop` now re-queries the sink for any remaining sink-input; if one
    is still routed, it adopts it and keeps streaming (restarting the pull
    only if the HTTP stream had already ended).
+10. **Source-app pause mapped onto the renderer transport** (`pa_dlna.py`):
+   when the source app is paused, PipeWire marks the sink-input as corked
+   (`pulse.corked` proplist) and feeds digital silence, so the null-sink
+   monitor keeps emitting zeros and pa-dlna streamed that silence to the
+   renderer **forever** — the DR70 kept "playing", so pause felt like it took
+   tens of seconds (or never happened at all). Patch: the `pulse.corked`
+   state is tracked from the sink-input 'change' events; a cork sends a SOAP
+   `Pause` to the AVTransport (the DR70 freezes instantly — also verified as
+   `PAUSED_PLAYBACK` with its position counter frozen), an uncork resumes
+   with `Play`. A transport stranded in `PAUSED_PLAYBACK` by a source app
+   that reconnects its stream mid-pause (rust-radio does this) or by a
+   renderer self-pause on underrun is restarted with a fresh
+   `SetAVTransportURI`+`Play` — unless the source is still corked, in which
+   case the pause is preserved for the cork-resume path.
+11. **Adopt-and-reconcile in `maybe_stop`** (`pa_dlna.py`): when a source
+   stream is reconnected while the renderer is paused, the resume 'change'
+   event arrives with a *new* sink-input index, so the cork-resume path
+   (which matches indices) could silently skip it and the renderer stayed
+   paused while the user was playing — "no sound". On adoption `maybe_stop`
+   now re-queries the live transport state and brings it in line with the
+   adopted stream: `Play` if the source is playing but the transport is
+   `PAUSED_PLAYBACK`, `Pause` if the source is still corked but the renderer
+   plays on (silence streaming), and a full `SetAVTransportURI`+`Play`
+   restart if the pull had already ended.
+12. **Auto-restore after a renderer drop** (`http_server.py`): the CelMus
+    DR70 sometimes aborts the HTTP pull on its own (connection reset) and
+    does not come back. With no pulse event following, nothing re-established
+    the stream: the renderer went silent even though the source kept playing
+    — "no sound" until a manual restart. `StreamSessions._linger()`, which
+    already kept the pipeline warm for 15s, now queues a restart (via the
+    existing `schedule_restart()`, run as a detached task *before* the
+    teardown so it cannot be cancelled) and the stream is re-issued with a
+    fresh `SetAVTransportURI`+`Play` whenever a sink-input is still routed
+    and the source is not corked. Verified: a simulated renderer drop
+    (`Stop`) is recovered automatically in ~17s.
+13. **Resilient long-pause resume + drop recovery cadence** (`pa_dlna.py`,
+    `http_server.py`): after ~10–12 s of pause the DR70 silently self-stops
+    (transport `STOPPED`, position reset) and an uncork then issues a bare
+    `Play` that targets a stopped transport — the device never responds, so
+    the renderer stays silent. The cork-resume path now always re-establishes
+    a fresh stream (`is_playing=False` then `SetAVTransportURI`+`Play`) like
+    the stranded-transport path in #10, so a mid-self-stop resume restarts
+    cleanly. During the recovery, a drop is *not* retried on a short (~2 s)
+    timer: while the DR70 is busy tearing down it rejects every pull, and an
+    ~8 s retry cadence kept it wedged in an endless play-6s/drop loop
+    (verified in the journal). The single `_linger()` restart after the 15 s
+    settle window is what the renderer actually accepts, so that is the one
+    retry per drop — worst case a long-pause resume gets sound back in ~17 s
+    (`Stop`→15 s linger→restart), typically the first `SetAVTransportURI`
+    right after the uncork is accepted.
+14. **Pause keepalive, pause/play verification, and a track-reader race**
+    (`pa_dlna.py`): three further hardening fixes against the DR70's flakiness
+    (it self-reboots and drops individual SOAPs throughout the day). (a) While
+    the source is paused, a background task polls `GetTransportInfo` every 4 s;
+    this resets the device's ~10 s idle watchdog so it stays in
+    `PAUSED_PLAYBACK` instead of self-stopping, and the resume is then instant
+    (verified live: the poll held the DR70 paused for 36 s and `Play` resumed
+    immediately) — previously a >10 s pause meant a ~25–30 s settle before
+    sound returned. (b) `Pause` and `Play` are each verified with a
+    `GetTransportInfo` read and retried once if the device silently dropped
+    them (observed during mid track-change flapping). (c) `set_avtransporturi`
+    now stops any still-running track first (mirroring
+    `set_nextavtransporturi`); a forced restart on resume used to issue
+    `SetAVTransportURI` while the warm pipeline's previous track was still
+    reading the shared encoder stream, raising
+    `readexactly() called while another coroutine is already waiting` (14
+    occurrences) and killing the stream silently.
 
 ## Troubleshooting
 

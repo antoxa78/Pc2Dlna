@@ -1,16 +1,32 @@
---- a/pa_dlna.py
-+++ b/pa_dlna.py
-@@ -33,6 +33,9 @@
+--- a/pa_dlna.py	2026-09-20 17:50:55.166293755 +0300
++++ b/pa_dlna.py	2026-09-20 18:26:37.121931627 +0300
+@@ -33,6 +33,16 @@
  # pulse event.
  NEW_SESSION_MAX_DELAY = 1
  ISSUE_48_TIMER = 2
 +# local patch: backoff after a transient UPnP SOAP fault from the renderer
 +# (e.g. a 501 while the DR70 resets itself) before retrying.
 +SOAP_RETRY_DELAY = 2
++# local patch: while the source app is paused the renderer sits idle in
++# PAUSED_PLAYBACK and watchdog renderers (CelMus DR70) self-stop after ~10s,
++# dropping the pull so a later resume needs a full ~20s settle before the
++# renderer accepts a stream again. A lightweight AVTransport read every few
++# seconds resets that watchdog and keeps the paused transport alive, so a
++# resume is instant. Must be well under the ~10s watchdog interval.
++CORK_HEARTBEAT_INTERVAL = 4
  
  def get_udn(data):
      """Build an UPnP udn."""
-@@ -278,22 +281,32 @@
+@@ -135,6 +145,8 @@
+         self.current_uri = None
+         self.new_pulse_session = False
+         self.suspended_state = False
++        self.sink_corked = False        # local patch: source app paused state
++        self.cork_keepalive_task = None # local patch: pause watchdog keepalive
+         self.stream_sessions = StreamSessions(self)
+         self.pulse_queue = asyncio.Queue()
+ 
+@@ -278,22 +290,39 @@
  
          # Run an AVTransport action if needed.
          try:
@@ -27,9 +43,16 @@
 +                # reset, which used to funnel the (re)connection down the
 +                # SetNextAVTransportURI path so that the stream was never
 +                # pulled again. If nothing is currently flowing, always
-+                # (re)start with SetAVTransportURI + Play.
++                # (re)start with SetAVTransportURI + Play. A transport
++                # stranded in 'PAUSED_PLAYBACK' (e.g. a source app that
++                # reconnected its stream while the user had paused, or a
++                # renderer that self-paused on an underrun) needs the same
++                # restart -- unless the source app itself is still corked
++                # (paused), in which case the pause must be preserved and
++                # the Play is issued by the cork-resume path instead.
 +                if (not self.stream_sessions.is_playing or
-+                        state in ('STOPPED', 'NO_MEDIA_PRESENT')):
++                        state in ('STOPPED', 'NO_MEDIA_PRESENT') or
++                        (state == 'PAUSED_PLAYBACK' and not self.sink_corked)):
 +                    await self.set_avtransporturi(action, state)
 +                    log_action(self.name, 'Play', state)
 +                    await self.play()
@@ -53,7 +76,38 @@
          except UPnPSoapFaultError as e:
              arg = e.args[0]
              if (hasattr(arg, 'errorCode') and
-@@ -332,6 +345,13 @@
+@@ -305,6 +334,30 @@
+ 
+         log_action(self.name, action, state, ignored=True)
+ 
++    async def cork_keepalive(self):
++        """While the source app is paused, poll the AVTransport every few
++        seconds so idle watchdog renderers (CelMus DR70 self-stops after
++        ~10s) do not drop the pull; the paused transport then resumes
++        instantly (verified live: GetTransportInfo every 4s kept the DR70 in
++        PAUSED_PLAYBACK for 36+s and Play resumed immediately).
++        """
++        try:
++            while (self.nullsink is not None and self.sink_corked and
++                    self.stream_sessions.is_playing):
++                await asyncio.sleep(CORK_HEARTBEAT_INTERVAL)
++                if (self.nullsink is None or not self.sink_corked or
++                        not self.stream_sessions.is_playing):
++                    break
++                try:
++                    logger.debug('%s: cork keepalive poll', self.name)
++                    await self.soap_action(AVTRANSPORT, 'GetTransportInfo',
++                                           {'InstanceID': 0})
++                except Exception:
++                    logger.debug('%s: cork keepalive SOAP failed, ignoring',
++                                 self.name)
++        finally:
++            self.cork_keepalive_task = None
++
+     async def handle_pulse_event(self):
+         """Handle a PulseAudio event.
+ 
+@@ -332,12 +385,96 @@
                  if event == 'exit':
                      self.exit_metadata = self.sink_input_meta(
                                                      self.nullsink.sink_input)
@@ -67,7 +121,90 @@
                  await self.handle_action('Stop')
              return
  
-@@ -397,8 +417,19 @@
+         assert sink is not None and sink_input is not None
+         try:
+             cur_metadata = self.sink_input_meta(sink_input)
++            # local patch: map the source app's pause state onto the DLNA
++            # transport. PipeWire/pipewire-pulse exposes a paused (corked)
++            # stream as the 'pulse.corked' proplist key ('true'/'false') on
++            # its sink-input and flips it with a 'change' event. While the
++            # source is corked it produces no samples and the null-sink
++            # monitor keeps emitting digital silence, so without this hook
++            # pa-dlna kept streaming silence to the renderer: the DR70 never
++            # went silent on pause (only after the buffer drained, if ever).
++            # Pause the renderer transport when the source pauses, Play when
++            # it resumes.
++            corked = (sink_input.proplist or {}).get('pulse.corked') in (
++                                                                'true', '1')
++            if corked != self.sink_corked:
++                self.sink_corked = corked
++                if (self.nullsink.sink_input is not None and
++                        sink_input.index == self.nullsink.sink_input.index):
++                    if self.encoder.soap_minimum_interval != 0:
++                        await self.soap_spacer.wait()
++                    if corked and self.stream_sessions.is_playing:
++                        log_action(self.name, 'Pause',
++                                   'source app paused')
++                        await self.soap_action(AVTRANSPORT, 'Pause',
++                                               {'InstanceID': 0})
++                        # local patch: the DR70 sometimes silently drops a
++                        # Pause (observed mid track-change / reconnect
++                        # flapping). Verify and retry once.
++                        state = await self.get_transport_state()
++                        if state == 'PLAYING':
++                            logger.debug('%s: Pause lost, retrying', self.name)
++                            await asyncio.sleep(1)
++                            await self.soap_action(AVTRANSPORT, 'Pause',
++                                                   {'InstanceID': 0})
++                        # local patch: keep polling the AVTransport while the
++                        # source stays paused so idle watchdog renderers
++                        # (CelMus DR70 self-stops after ~10s) do not drop the
++                        # pull; a resume is then instant instead of waiting
++                        # out the watchdog's ~20s settle window. The loop
++                        # below stops by itself once the source uncorks.
++                        if (self.cork_keepalive_task is None or
++                                self.cork_keepalive_task.done()):
++                            self.cork_keepalive_task = \
++                                self.stream_sessions.stream_tasks.create_task(
++                                    self.cork_keepalive(),
++                                    name='cork-keepalive')
++                    elif not corked:
++                        # Resume. A plain Play only resumes a transport that
++                        # is still in PAUSED_PLAYBACK with a live pull. The
++                        # keepalive above keeps the paused transport alive,
++                        # so a bare Play resumes instantly. If the keepalive
++                        # was missed (a network blip during the pause) the
++                        # DR70 has self-stopped: it needs a fresh
++                        # SetAVTransportURI + Play, which setting
++                        # is_playing=False forces in handle_action.
++                        if not cur_metadata.title:
++                            cur_metadata = cur_metadata._replace(
++                                            title=cur_metadata.publisher)
++                        log_action(self.name, 'Play',
++                                   'source app resumed')
++                        if self.stream_sessions.is_playing:
++                            state = await self.get_transport_state()
++                            if state == 'PAUSED_PLAYBACK':
++                                await self.play()
++                                # local patch: the DR70 sometimes drops a
++                                # Play too; verify and retry once.
++                                state = await self.get_transport_state()
++                                if state != 'PLAYING':
++                                    logger.debug('%s: Play lost, retrying',
++                                                 self.name)
++                                    await asyncio.sleep(1)
++                                    await self.play()
++                            else:
++                                self.stream_sessions.is_playing = False
++                                await self.handle_action(cur_metadata)
++                        else:
++                            self.stream_sessions.is_playing = False
++                            await self.handle_action(cur_metadata)
++
+             if self.nullsink.sink_input is None:
+                 self.new_pulse_session = True
+                 # The reconnection of a sink-input after an exit is signaled
+@@ -397,8 +534,19 @@
      async def select_encoder(self, udn):
          """Select an encoder matching the DLNA device supported mime types."""
  
@@ -89,7 +226,22 @@
          res = select_encoder(self.control_point.config, self.name,
                               protocol_info, udn)
          if res is None:
-@@ -488,6 +519,34 @@
+@@ -436,6 +584,14 @@
+     async def set_avtransporturi(self, metadata, state):
+         await self.add_application()
+ 
++        # local patch: stop any still-running track first, mirroring
++        # set_nextavtransporturi(). A forced restart (resume/adopt) issues
++        # SetAVTransportURI while the warm pipeline's previous track is still
++        # reading the shared encoder stream; without stopping it, the new
++        # track's read races it ('readexactly() called while another
++        # coroutine is already waiting') and the stream dies silently.
++        await self.stream_sessions.stop_track()
++
+         action = 'SetAVTransportURI'
+         didl_lite = self.didl_lite_metadata(metadata)
+         args = {'InstanceID': 0,
+@@ -488,6 +644,63 @@
          #   changes.
          await asyncio.sleep(ISSUE_48_TIMER)
  
@@ -108,23 +260,52 @@
 +        if sink_input is not None:
 +            self.nullsink.sink_input = sink_input
 +            self.log_pulse_event('remove ignored', sink_input)
-+            # The stream is still flowing: nothing to do. If the pull had
-+            # already ended, (re)start it with a fresh
-+            # SetAVTransportURI + Play (handle_action restarts when the
-+            # HTTP stream is not running).
-+            if not self.stream_sessions.is_playing:
++            # local patch: reconcile the renderer transport with the
++            # source's current state instead of trusting the state captured
++            # at the 'remove' event. A resume 'change' event for a
++            # reconnected stream is delivered with a *new* sink-input index,
++            # so the cork-resume path (which matches indices) may silently
++            # skip it and the renderer stays paused while the user is
++            # playing: no sound. Re-query the live transport state and bring
++            # it in line with the adopted stream.
++            if self.encoder.soap_minimum_interval != 0:
++                await self.soap_spacer.wait()
++            state = await self.get_transport_state()
++            if (not self.stream_sessions.is_playing or
++                    state in ('STOPPED', 'NO_MEDIA_PRESENT')):
++                # The pull had already ended (or the renderer stopped / never
++                # got a URI): (re)start it with a fresh
++                # SetAVTransportURI + Play (handle_action restarts when the
++                # HTTP stream is not running or the transport is stopped).
 +                cur_metadata = self.sink_input_meta(sink_input)
 +                if not cur_metadata.title:
 +                    cur_metadata = cur_metadata._replace(
 +                                        title=cur_metadata.publisher)
 +                logger.info(f'Streaming {sink_input.name} on {self.name}')
 +                await self.handle_action(cur_metadata)
++            elif (state == 'PAUSED_PLAYBACK' and not self.sink_corked):
++                # The source is playing but the renderer is paused (the
++                # resume event was skipped because of the index change):
++                # resume it, otherwise the device stays silent.
++                if self.encoder.soap_minimum_interval != 0:
++                    await self.soap_spacer.wait()
++                log_action(self.name, 'Play', 'adopted stream')
++                await self.play()
++            elif (state == 'PLAYING' and self.sink_corked):
++                # The source is paused but the renderer still plays: the
++                # cork Pause was skipped for the same reason, and without it
++                # digital silence keeps streaming. Pause the renderer.
++                if self.encoder.soap_minimum_interval != 0:
++                    await self.soap_spacer.wait()
++                log_action(self.name, 'Pause', 'adopted corked stream')
++                await self.soap_action(AVTRANSPORT, 'Pause',
++                                       {'InstanceID': 0})
 +            return
 +
          cur_index = self.get_sink_input_index()
          if cur_index is not None and cur_index != index:
              # A new track is being played.
-@@ -557,14 +616,50 @@
+@@ -557,14 +770,50 @@
              # ever.
              test_end = self.control_point.test_end
              while test_end is None or not test_end.done():

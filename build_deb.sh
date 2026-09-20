@@ -16,7 +16,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE=pc2dlna
-VERSION=1.9
+VERSION=1.14
 BUILD_DIR="$PROJECT_DIR/build"
 ROOT="$BUILD_DIR/${PACKAGE}_${VERSION}"
 DEB="$BUILD_DIR/Pc2Dlna_${VERSION}_all.deb"
@@ -158,6 +158,22 @@ Description: Stream PC audio to DLNA renderers with reliability fixes
    * use HTTP/1.1 instead of HTTP/1.0 when querying device descriptions,
    * keep the pipeline warm across renderer drops, and
    * auto-restart the stream if the recorder ends unexpectedly.
+   * map the source app's pause (cork) onto a renderer Pause/Play, so pausing
+     the player actually silences the renderer instantly instead of streaming
+     digital silence forever, and
+   * reconcile the renderer transport when a reconnected stream is adopted,
+     so a skipped resume/cork event can't leave the renderer silently paused.
+   * auto-restore the stream after a renderer drop ("no sound" bug): if the
+     renderer aborts the HTTP pull and never comes back within the linger
+     window, re-establish the stream whenever the source is still playing.
+   * resilient resume after a long pause: the DR70 self-stops (and ignores a
+     bare Play) after ~10 s of pause, so resuming restarts a fresh stream, and
+     the recovery waits out the device's settle window to avoid an endless
+     play/drop loop.
+   * pause keepalive: while the source is paused, a lightweight poll holds the
+     renderer in PAUSED_PLAYBACK so a resume is instant instead of waiting out
+     the device's ~10 s idle watchdog, and Pause/Play are verified + retried
+     once when the device silently drops a SOAP.
  .
  Requires the exact pa-dlna version (and Python minor version) the modules were
  built against; rebuild the package after upgrading either.
