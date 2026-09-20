@@ -1,0 +1,14 @@
+[Unit]
+Description=pa-dlna: forward PulseAudio/PipeWire streams to DLNA renderers
+After=pipewire-pulse.service
+Wants=pipewire-pulse.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pa-dlna@NICARG@ -m 15 --loglevel info
+Environment=PULSE_SERVER=unix:%t/pulse/native
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

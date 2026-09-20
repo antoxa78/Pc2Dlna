@@ -1,0 +1,47 @@
+--- a/upnp/upnp.py
++++ b/upnp/upnp.py
+@@ -211,8 +211,15 @@
+         description = await http_get(self.SCPDURL)
+         self.description = description.decode()
+ 
+-        # Parse the actionList.
+-        scpd, namespace = upnp_org_etree(self.description)
++        # Parse the actionList. Some devices (e.g. CelMus DR70) expose
++        # extra services whose SCPD uses a foreign namespace and yields no
++        # elements under urn:schemas-upnp-org:. Skip those instead of
++        # killing the whole device.
++        try:
++            scpd, namespace = upnp_org_etree(self.description)
++        except UPnPXMLError as e:
++            logger.warning(f'Skipping service {self.serviceId}: {e}')
++            return self
+         self.actionList = scpd_actionlist(scpd, namespace)
+ 
+         # Parse the serviceStateTable.
+@@ -587,16 +594,23 @@
+             logger.info('Close UPnPControlPoint')
+ 
+     def disable_root_device(self, root_device, name=None):
+-        """Disable permanently a root device."""
++        """Disable a root device after an error.
++
++        local patch: do not blacklist the udn permanently. Devices such as
++        the CelMus DR70 briefly drop their UPnP stack (byebye / resets) and
++        re-advertise moments later; a permanent blacklist meant streaming
++        stayed dead until a manual restart. Now the device is simply closed
++        and re-created on the next alive advertisement or msearch response.
++        """
+ 
+         udn = root_device.udn
+         if udn in self._faulty_devices:
+             return
+ 
+-        self._faulty_devices.add(udn)
+         root_device.close()
+         devname = f'{root_device} UPnP' if name is None else f'{name} DLNA'
+-        logger.warning(f'Disable the {devname} device permanently')
++        logger.warning(f'Disable the {devname} device (re-enabling on next'
++                       f' discovery)')
+ 
+     def is_disabled(self, root_device):
+         return root_device.udn in self._faulty_devices

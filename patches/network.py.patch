@@ -1,0 +1,38 @@
+--- a/upnp/network.py
++++ b/upnp/network.py
+@@ -136,7 +136,16 @@
+         header = http_header_as_dict(header[1:])
+         check_ssdp_header(header, is_msearch)
+     except UPnPInvalidSsdpError as e:
+-        logger.warning(f'Error from {peer_ipaddress}: {e}')
++        # local patch: announce packets that merely miss a required field are
++        # extremely common on home networks (the CelMus DR70 multicasts a
++        # proprietary ssdp:all announce without LOCATION/USN every 15 secs,
++        # which would spam the log). They can never be turned into a device,
++        # so log them at debug level. Keep a warning for truly malformed
++        # headers.
++        if e.args and str(e.args[0]).startswith('missing "'):
++            logger.debug(f'Ignored malformed SSDP from {peer_ipaddress}: {e}')
++        else:
++            logger.warning(f'Error from {peer_ipaddress}: {e}')
+         return None
+ 
+     # Ignore non root device responses.
+@@ -347,10 +356,16 @@
+         reader, writer = await asyncio.open_connection(host, port)
+ 
+         # Send the request.
++        # local patch: use HTTP/1.1 + Connection: close instead of HTTP/1.0.
++        # Some devices (e.g. tegra/Chromecast based) refuse HTTP/1.0
++        # requests (empty header), which made pa-dlna loop forever trying to
++        # introspect them. Requesting 'Connection: close' avoids hanging on
++        # keep-alive connects in the no Content-Length case.
+         request = urlobj._replace(scheme='')._replace(netloc='').geturl()
+         query = (
+-            f"{method} {request or '/'} HTTP/1.0\r\n"
++            f"{method} {request or '/'} HTTP/1.1\r\n"
+             f"Host: {host}:{port}\r\n"
++            f"Connection: close\r\n"
+         )
+         query = query + header + '\r\n'
+         writer.write(query.encode('latin-1'))

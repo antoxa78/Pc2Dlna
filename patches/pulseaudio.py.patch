@@ -1,0 +1,57 @@
+--- a/pulseaudio.py
++++ b/pulseaudio.py
+@@ -100,10 +100,31 @@
+         module_name = f'{renderer.getattr("modelName")}-{upnp_device.UDN}'
+-        _description = renderer.description.replace(' ', r'\ ')
+ 
++        # Create the null-sink at the rate of the streamed encoder so the
++        # monitor output (and thus the DLNA stream and DAC) runs at the
++        # source-native rate instead of the PulseAudio default (48 kHz).
++        # Otherwise 44.1 kHz content gets resampled to 48 kHz and the DAC
++        # displays the wrong rate.
++        sink_rate = None
++        try:
++            sink_rate = int(next(
++                iter(self.av_control_point.config.encoders.values())).rate)
++        except (StopIteration, AttributeError, TypeError, ValueError):
++            pass
++
++        # The whole 'sink_properties' value must be one quoted string,
++        # otherwise the extra property is parsed as a separate (unknown)
++        # module argument, which PulseAudio rejects. module-null-sink has
++        # no 'source_properties': the monitor shares the sink's node.
++        desc = renderer.description.replace("'", '').replace('"', '')
++        sink_args = (f'sink_name="{module_name}" '
++                     f'sink_properties="device.description=\'{desc}\''
++                     ' session.suspend-timeout-seconds=0"')
++        if sink_rate:
++            sink_args += f' rate={sink_rate}'
++
+         module_index = await self.lib_pulse.pa_context_load_module(
+                 'module-null-sink',
+-                f'sink_name="{module_name}" '
+-                f'sink_properties=device.description=' f'"{_description}"')
++                f'{sink_args}')
+ 
+         if module_index == PA_INVALID_INDEX:
+             logger.error(f'Failed loading {module_name} pulseaudio module')
+@@ -244,8 +265,17 @@
+                     # previous one (or if the previous one does not exist) and
+                     # the event type is `change`.
+                     pass
+-                elif sink_input.index == renderer.previous_idx:
+-                    # Ignore event related to the previous sink-input.
++                elif (sink_input.index == renderer.previous_idx and
++                        renderer.nullsink.sink_input is not None and
++                        sink_input.index ==
++                                    renderer.nullsink.sink_input.index):
++                    # local patch: only drop events that reference an *older*
++                    # sink-input that a newer one has taken over from. An
++                    # event for the sink-input currently associated to the
++                    # renderer is a live change (e.g. the source app dropped
++                    # and reconnected with the same index) and must be
++                    # processed, or the renderer never re-issues
++                    # SetAVTransportURI/Play after the device was Stopped.
+                     pass
+                 else:
+                     renderer.pulse_queue.put_nowait(

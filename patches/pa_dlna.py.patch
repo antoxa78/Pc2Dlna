@@ -1,0 +1,179 @@
+--- a/pa_dlna.py
++++ b/pa_dlna.py
+@@ -33,6 +33,9 @@
+ # pulse event.
+ NEW_SESSION_MAX_DELAY = 1
+ ISSUE_48_TIMER = 2
++# local patch: backoff after a transient UPnP SOAP fault from the renderer
++# (e.g. a 501 while the DR70 resets itself) before retrying.
++SOAP_RETRY_DELAY = 2
+ 
+ def get_udn(data):
+     """Build an UPnP udn."""
+@@ -278,22 +281,32 @@
+ 
+         # Run an AVTransport action if needed.
+         try:
+-            if state not in ('STOPPED', 'NO_MEDIA_PRESENT'):
+-                if isinstance(action, MetaData):
+-                    if self.encoder.track_metadata:
+-                        await self.set_nextavtransporturi(action, state)
++            if isinstance(action, MetaData):
++                # local patch: whether a MetaData action starts a fresh
++                # stream or signals a track change is decided by the state of
++                # the actual HTTP stream, not by the transport state reported
++                # by the renderer. Renderers like the CelMus DR70 keep
++                # reporting 'PLAYING' after the transport was stopped or
++                # reset, which used to funnel the (re)connection down the
++                # SetNextAVTransportURI path so that the stream was never
++                # pulled again. If nothing is currently flowing, always
++                # (re)start with SetAVTransportURI + Play.
++                if (not self.stream_sessions.is_playing or
++                        state in ('STOPPED', 'NO_MEDIA_PRESENT')):
++                    await self.set_avtransporturi(action, state)
++                    log_action(self.name, 'Play', state)
++                    await self.play()
+                     return
+-                elif action == 'Stop':
++                if self.encoder.track_metadata:
++                    await self.set_nextavtransporturi(action, state)
++                return
++            elif state not in ('STOPPED', 'NO_MEDIA_PRESENT'):
++                if action == 'Stop':
+                     index = self.get_sink_input_index()
+                     self.stream_sessions.stream_tasks.create_task(
+                                             self.maybe_stop(index, state),
+                                             name=f'maybe_stop {self.name}')
+                     return
+-            elif isinstance(action, MetaData):
+-                await self.set_avtransporturi(action, state)
+-                log_action(self.name, 'Play', state)
+-                await self.play()
+-                return
+         except UPnPSoapFaultError as e:
+             arg = e.args[0]
+             if (hasattr(arg, 'errorCode') and
+@@ -332,6 +345,13 @@
+                 if event == 'exit':
+                     self.exit_metadata = self.sink_input_meta(
+                                                     self.nullsink.sink_input)
++                    # local patch: the stream was routed away but the same
++                    # app reconnects moments later with the same sink-input
++                    # index. Forget the sink-input so that reconnect is
++                    # treated as a fresh session and the renderer re-issues
++                    # SetAVTransportURI/Play (otherwise the DLNA device is
++                    # left in the STOPPED state and never pulls again).
++                    self.nullsink.sink_input = None
+                 await self.handle_action('Stop')
+             return
+ 
+@@ -397,8 +417,19 @@
+     async def select_encoder(self, udn):
+         """Select an encoder matching the DLNA device supported mime types."""
+ 
+-        protocol_info = await self.soap_action(CONNECTIONMANAGER,
+-                                               'GetProtocolInfo')
++        try:
++            protocol_info = await self.soap_action(CONNECTIONMANAGER,
++                                                   'GetProtocolInfo')
++        except UPnPSoapFaultError as e:
++            # local patch: a transient 501 from the renderer when probing its
++            # protocols must not tear down the renderer (unload the null-sink
++            # and kill the running stream). If we have already selected an
++            # encoder, keep it: the renderer re-pulls the current URI and the
++            # stream keeps flowing.
++            logger.warning(f'GetProtocolInfo transient fault: {e!r}')
++            if self.encoder is not None:
++                return True
++            raise
+         res = select_encoder(self.control_point.config, self.name,
+                              protocol_info, udn)
+         if res is None:
+@@ -488,6 +519,34 @@
+         #   changes.
+         await asyncio.sleep(ISSUE_48_TIMER)
+ 
++        # local patch: before stopping the DLNA device, check whether any
++        # sink-input is still routed to the null-sink. The monitor carries
++        # the mix of all sink-inputs, so removing a single stream must not
++        # tear the whole session down: that stopped playback while other
++        # apps were still producing audio and left the DR70 permanently
++        # silent. Adopt the remaining stream and keep playing.
++        try:
++            sink_input = await self.control_point.pulse.get_sink_input(self)
++        except Exception as e:
++            logger.warning(f'Cannot list sink-inputs at '
++                           f'maybe_stop(): {e!r}')
++            sink_input = None
++        if sink_input is not None:
++            self.nullsink.sink_input = sink_input
++            self.log_pulse_event('remove ignored', sink_input)
++            # The stream is still flowing: nothing to do. If the pull had
++            # already ended, (re)start it with a fresh
++            # SetAVTransportURI + Play (handle_action restarts when the
++            # HTTP stream is not running).
++            if not self.stream_sessions.is_playing:
++                cur_metadata = self.sink_input_meta(sink_input)
++                if not cur_metadata.title:
++                    cur_metadata = cur_metadata._replace(
++                                        title=cur_metadata.publisher)
++                logger.info(f'Streaming {sink_input.name} on {self.name}')
++                await self.handle_action(cur_metadata)
++            return
++
+         cur_index = self.get_sink_input_index()
+         if cur_index is not None and cur_index != index:
+             # A new track is being played.
+@@ -557,14 +616,50 @@
+             # ever.
+             test_end = self.control_point.test_end
+             while test_end is None or not test_end.done():
+-                await self.handle_pulse_event()
++                try:
++                    await self.handle_pulse_event()
++                except UPnPSoapFaultError as e:
++                    # local patch: renderers such as the CelMus DR70 briefly
++                    # answer SOAP actions with an error (501) during their
++                    # own internal resets. Tearing the renderer down here
++                    # unloads the null-sink and kills the running pipeline,
++                    # which turned every momentary blip into minutes of dead
++                    # air. Keep the renderer and its null-sink registered and
++                    # retry on the next event/discovery cycle instead: the
++                    # DR70 keeps re-pulling the current URI, so an
++                    # established stream simply keeps flowing.
++                    logger.error(f'{e!r}')
++                    await asyncio.sleep(SOAP_RETRY_DELAY)
++                    # The pulse event that raised the fault has already
++                    # been consumed from the queue, so it is lost. Replay
++                    # the current state from pulseaudio instead: if a
++                    # sink-input is still routed to the null-sink,
++                    # handle_action() (re)starts the stream when it is not
++                    # flowing, or is a track change otherwise.
++                    try:
++                        sink_input = await (self.control_point.pulse.
++                                            get_sink_input(self))
++                        if sink_input is not None:
++                            self.nullsink.sink_input = sink_input
++                            metadata = self.sink_input_meta(sink_input)
++                            if not metadata.title:
++                                metadata = metadata._replace(
++                                            title=metadata.publisher)
++                            await self.handle_action(metadata)
++                    except UPnPSoapFaultError as e2:
++                        logger.error(f'retry after SOAP fault: {e2!r}')
++                    except Exception as e2:
++                        logger.warning(f'cannot retry after SOAP fault:'
++                                       f' {e2!r}')
+             await self.close()
+ 
+         except asyncio.CancelledError:
+             pass
+         except UPnPSoapFaultError as e:
++            # Fault on the initial encoder selection (before the event loop):
++            # do not blacklist nor tear down anything permanent, the next
++            # discovery cycle re-registers the renderer.
+             logger.error(f'{e!r}')
+-            await self.disable_root_device()
+         except (OSError, UPnPClosedDeviceError, ControlPointAbortError) as e:
+             logger.error(f'{e!r}')
+         except Exception:
