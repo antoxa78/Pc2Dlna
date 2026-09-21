@@ -1,5 +1,5 @@
---- a/upnp/network.py
-+++ b/upnp/network.py
+--- a/upnp/network.py	2026-09-20 19:00:46.046695949 +0300
++++ b/upnp/network.py	2026-09-20 19:00:46.056504867 +0300
 @@ -136,7 +136,16 @@
          header = http_header_as_dict(header[1:])
          check_ssdp_header(header, is_msearch)
@@ -18,6 +18,15 @@
          return None
  
      # Ignore non root device responses.
+@@ -338,7 +347,7 @@
+ async def http_query(method, url, header='', body=''):
+     """An HTTP 1.0 GET or POST request."""
+ 
+-    assert method in ('GET', 'POST')
++    assert method in ('GET', 'POST', 'SUBSCRIBE', 'UNSUBSCRIBE')
+     writer = None
+     try:
+         urlobj = urllib.parse.urlsplit(url)
 @@ -347,10 +356,16 @@
          reader, writer = await asyncio.open_connection(host, port)
  
@@ -36,3 +45,21 @@
          )
          query = query + header + '\r\n'
          writer.write(query.encode('latin-1'))
+@@ -435,6 +450,17 @@
+                                    f" from {host}")
+     return is_fault, body
+ 
++async def http_subscribe(url, header, body=''):
++    """A GENA SUBSCRIBE request (initial subscription or renewal)."""
++    header_lines, body, host = await http_query('SUBSCRIBE', url, header,
++                                                body)
++    return header_lines, body
++
++async def http_unsubscribe(url, header):
++    """A GENA UNSUBSCRIBE request."""
++    header_lines, body, host = await http_query('UNSUBSCRIBE', url, header)
++    return header_lines, body
++
+ # Classes.
+ class Notify:
+     """Implement the SSDP advertisement protocol.

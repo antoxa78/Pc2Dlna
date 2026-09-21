@@ -256,6 +256,45 @@ pactl set-default-sink "CelCast-uuid:85f70b2d-3c72-501f-a172-07bbc058d793"
     reading the shared encoder stream, raising
     `readexactly() called while another coroutine is already waiting` (14
     occurrences) and killing the stream silently.
+15. **GENA event subscription** (`upnp/upnp.py`, `upnp/network.py`,
+    `pa_dlna.py`): the DR70 advertises `LastChange` as an evented AVTransport
+    state variable and supports the standard UPnP eventing mechanism, so
+    pa-dlna now *subscribes* to it instead of only discovering a self-stop
+    from a connection drop. A `GENAEventServer` (one ephemeral local HTTP
+    port) receives the device's `NOTIFY` messages, parses the `LastChange`
+    XML, and a renderer callback reacts the instant `TransportState` becomes
+    `STOPPED` while the source is still playing: the stream is restarted
+    immediately (2 s, with a 30 s cooldown) rather than after the ~15 s drop
+    settle window. The subscription is renewed before its 300 s timeout and
+    cleaned up when the device sends `byebye`. Verified live: subscribe →
+    SID, initial `PLAYING` event, then `STOPPED` → auto-restart → `PLAYING`.
+16. **`SetNextAVTransportURI` not in the DR70 actionList** (`pa_dlna.py`):
+    on a track change (a new `media.title` from the source app) the code took
+    the gapless `SetNextAVTransportURI` path, but the CelMus DR70 does not
+    advertise that action. `soap_action()` raises `UPnPInvalidSoapError` for
+    an action missing from the actionList — that is *not* a SOAP fault, so it
+    escaped `handle_action()`, tore the whole renderer down (the null-sink was
+    unloaded and the source app bounced back to the laptop/default sink), and
+    playback only resumed after the ~30 s rediscovery cycle re-registered the
+    device. Patch: `handle_action()` checks
+    `supports_action('SetNextAVTransportURI')` and, when the renderer does not
+    implement it, a track change **skips the SOAP entirely** and lets the
+    live monitor stream carry the new track seamlessly. (The first fix pushed
+    the metadata with a fresh `SetAVTransportURI` + `Play` instead — but that
+    closed the HTTP connection the DR70 was playing, and the DR70 firmware
+    self-stops ~5 s after such an EOF, causing an audible
+    play-7s/stop/restart cycle on *every* track change. The trade-off of the
+    final fix: the renderer display keeps the session's first track title
+    until the next real stream (re)start.)
+17. **Transient SOAP/HTTP errors still tore the renderer down** (`pa_dlna.py`):
+    the DR70 also answers SOAP actions with an empty/malformed HTTP response
+    (`UPnPInvalidHttpError`) during its internal resets, which escaped the
+    `UPnPSoapFaultError` handler in the run loop and hit the catch-all
+    `disable_root_device()` — same ~30 s dead air (null-sink unload +
+    rediscovery + re-pull). Patch: the run loop and `maybe_stop()` now treat
+    `UPnPInvalidHttpError` like a transient SOAP fault (log, back off, replay
+    the pulse state; never unload the sink), and the `maybe_stop()` transport
+    reconcile is guarded so a flaky response cannot kill that task either.
 
 ## Troubleshooting
 

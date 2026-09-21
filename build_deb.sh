@@ -16,7 +16,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE=pc2dlna
-VERSION=1.14
+VERSION=1.17
 BUILD_DIR="$PROJECT_DIR/build"
 ROOT="$BUILD_DIR/${PACKAGE}_${VERSION}"
 DEB="$BUILD_DIR/Pc2Dlna_${VERSION}_all.deb"
@@ -174,6 +174,19 @@ Description: Stream PC audio to DLNA renderers with reliability fixes
      renderer in PAUSED_PLAYBACK so a resume is instant instead of waiting out
      the device's ~10 s idle watchdog, and Pause/Play are verified + retried
      once when the device silently drops a SOAP.
+   * GENA eventing: subscribes to the renderer's AVTransport LastChange
+     events, so a self-stop to STOPPED is detected instantly and the stream is
+     restarted immediately instead of after the drop settle window.
+   * SetNextAVTransportURI fallback: renderers that omit that action from
+     their AVTransport actionList (the CelMus DR70) no longer crash the
+     renderer task on a track change; a track change now skips the SOAP and
+     keeps the live stream flowing (no metadata push, no connection close),
+     which also avoids the DR70 firmware's ~5 s self-stop-after-EOF that made
+     every track change audible as a play/stop/restart cycle.
+   * transient HTTP errors: empty/malformed SOAP responses from the renderer
+     are treated like SOAP faults in the event loop and maybe_stop() — logged,
+     backed off and retried — instead of tearing the renderer down for a
+     ~30 s rediscovery cycle.
  .
  Requires the exact pa-dlna version (and Python minor version) the modules were
  built against; rebuild the package after upgrading either.

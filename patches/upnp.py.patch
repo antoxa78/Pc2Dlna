@@ -1,6 +1,77 @@
---- a/upnp/upnp.py
-+++ b/upnp/upnp.py
-@@ -211,8 +211,15 @@
+--- a/upnp/upnp.py	2026-09-20 19:00:46.042934504 +0300
++++ b/upnp/upnp.py	2026-09-20 19:00:46.051835696 +0300
+@@ -50,13 +50,15 @@
+ import re
+ import collections
+ import urllib.parse
++import xml.etree.ElementTree
+ from ipaddress import IPv4Interface, IPv4Address
+ from signal import SIGINT, SIGTERM, strsignal
+ 
+ from . import UPnPError, TEST_LOGLEVEL
+ from .util import NL_INDENT, shorten, log_unhandled_exception, AsyncioTasks
+ from .network import (ipaddr_from_nics, parse_ssdp, msearch, send_mcast,
+-                      Notify, http_get, http_soap)
++                      Notify, http_get, http_soap, http_subscribe,
++                      http_unsubscribe, http_header_as_dict)
+ from .xml import (upnp_org_etree, build_etree, xml_of_subelement,
+                   findall_childless, scpd_actionlist, scpd_servicestatetable,
+                   dict_to_xml, parse_soap_response, parse_soap_fault,
+@@ -69,6 +71,40 @@
+ SERVICEID_PREFIX = 'urn:upnp-org:serviceId:'
+ RE_MAX_AGE = re.compile(r'\s*max-age\s*=\s*(\d+)')
+ 
++def _parse_lastchange(body):
++    """Parse a GENA event body into {stateVariable: value}.
++
++    The body is an '<e:propertyset>' with a '<LastChange>' property whose
++    value is an XML-escaped '<Event>' document of AVT/RCS InstanceID and
++    state-variable elements carrying their value in a 'val' attribute.
++    """
++    state_vars = {}
++    if not body:
++        return state_vars
++    try:
++        root = xml.etree.ElementTree.fromstring(body)
++    except xml.etree.ElementTree.ParseError:
++        return state_vars
++    for el in root.iter():
++        tag = el.tag
++        name = tag.split('}', 1)[-1] if tag.startswith('{') else tag
++        if name != 'LastChange':
++            continue
++        text = el.text
++        if not text:
++            break
++        try:
++            event = xml.etree.ElementTree.fromstring(text)
++        except xml.etree.ElementTree.ParseError:
++            break
++        for var in event.iter():
++            vtag = var.tag
++            vname = vtag.split('}', 1)[-1] if vtag.startswith('{') else vtag
++            if vname != 'InstanceID' and 'val' in var.attrib:
++                state_vars[vname] = var.attrib['val']
++        break
++    return state_vars
++
+ class UPnPClosedControlPointError(UPnPError): pass
+ class UPnPClosedDeviceError(UPnPError): pass
+ class UPnPInvalidSoapError(UPnPError): pass
+@@ -135,6 +171,12 @@
+         self.serviceStateTable = {}
+         self.description = None
+ 
++        # local patch: GENA event subscription state.
++        self.sid = None
++        self._event_timeout = None
++        self._renew_task = None
++        self.event_listener = None
++
+     async def soap_action(self, action, args, log_debug=True):
+         """Send a SOAP action.
+ 
+@@ -211,18 +253,88 @@
          description = await http_get(self.SCPDURL)
          self.description = description.decode()
  
@@ -18,7 +89,116 @@
          self.actionList = scpd_actionlist(scpd, namespace)
  
          # Parse the serviceStateTable.
-@@ -587,16 +594,23 @@
+         self.serviceStateTable = scpd_servicestatetable(scpd, namespace)
+ 
+-        # Start the eventing task.
+-        # Not implemented.
+-
+         return self
+ 
++    # local patch: GENA event subscription (UPnP eventing).
++
++    async def subscribe(self, callback_url, timeout=300, listener=None):
++        """Subscribe to this service's event notifications (GENA).
++
++        'callback_url' is the URL the device delivers NOTIFY events to (must
++        be reachable from the device). 'listener' is a callable called with a
++        dict {stateVariable: value} on each event.
++        """
++        if self.eventSubURL is None:
++            return None
++        self.event_listener = listener
++        self._event_timeout = timeout
++        header = (f'Callback: <{callback_url}>\r\n'
++                  f'NT: upnp:event\r\n'
++                  f'Timeout: Second-{timeout}\r\n')
++        header_lines, _ = await http_subscribe(self.eventSubURL, header)
++        hd = http_header_as_dict(header_lines[1:])
++        sid = hd.get('SID')
++        if sid is None:
++            raise UPnPError(f'subscribe() failed on {self}:'
++                            f' {header_lines!r}')
++        self.sid = sid
++        self.root_device._control_point._register_subscription(sid, self)
++        self._renew_task = asyncio.ensure_future(self._renew())
++        return sid
++
++    async def _renew(self):
++        """Keep the subscription alive by renewing before it expires."""
++        timeout = self._event_timeout or 300
++        try:
++            while self.sid is not None and not self.closed:
++                await asyncio.sleep(max(timeout - 15, 10))
++                if self.sid is None or self.closed:
++                    break
++                header = (f'SID: {self.sid}\r\n'
++                          f'Timeout: Second-{timeout}\r\n')
++                try:
++                    await http_subscribe(self.eventSubURL, header)
++                except Exception as e:
++                    logger.warning(f'{self}: event subscription renewal'
++                                   f' failed: {e!r}')
++        except asyncio.CancelledError:
++            pass
++        finally:
++            self._renew_task = None
++
++    async def unsubscribe(self):
++        if self.sid is None:
++            return
++        sid = self.sid
++        self.sid = None
++        if (self._renew_task is not None and
++                self._renew_task is not asyncio.current_task()):
++            self._renew_task.cancel()
++            self._renew_task = None
++        self.root_device._control_point._unregister_subscription(sid)
++        try:
++            await http_unsubscribe(self.eventSubURL, f'SID: {sid}\r\n')
++        except Exception as e:
++            logger.debug(f'{self}: unsubscribe failed: {e!r}')
++
++    def _on_event(self, state_vars):
++        if self.event_listener is not None:
++            self.event_listener(state_vars)
++
+     def __str__(self):
+         return (self.serviceId[len(SERVICEID_PREFIX):] if
+                 self.serviceId.startswith(SERVICEID_PREFIX) else
+@@ -555,6 +667,10 @@
+         self._msearch_task = None
+         self._notify_task = None
+         self._upnp_tasks = AsyncioTasks()
++        # local patch: GENA event server + subscriptions {sid: UPnPService}.
++        self._event_server = None
++        self._event_port = 0
++        self._subscriptions = {}
+ 
+     def open(self):
+         """Start the UPnP Control Point."""
+@@ -568,6 +684,11 @@
+         self._notify_task = self._upnp_tasks.create_task(self._ssdp_notify(),
+                                                         name='ssdp notify')
+ 
++        # local patch: start the GENA event server that receives NOTIFY
++        # events from subscribed services.
++        self._upnp_tasks.create_task(self._run_event_server(),
++                                     name='gena event server')
++
+     def close(self):
+         """Close the UPnP Control Point."""
+ 
+@@ -580,6 +701,9 @@
+             if self._notify_task is not None:
+                 self._notify_task.cancel()
+                 self._notify.close()
++            if self._event_server is not None:
++                self._event_server.close()
++                self._event_server = None
+ 
+             for root_device in list(self._devices.values()):
+                 root_device.close()
+@@ -587,20 +711,104 @@
              logger.info('Close UPnPControlPoint')
  
      def disable_root_device(self, root_device, name=None):
@@ -45,3 +225,103 @@
  
      def is_disabled(self, root_device):
          return root_device.udn in self._faulty_devices
+ 
++    # local patch: GENA event server and subscription registry.
++
++    def _callback_url(self):
++        ip = next(iter(self.ip_monitored), None) or '127.0.0.1'
++        return f'http://{ip}:{self._event_port}/notify'
++
++    def _register_subscription(self, sid, service):
++        self._subscriptions[sid] = service
++
++    def _unregister_subscription(self, sid):
++        self._subscriptions.pop(sid, None)
++
++    def _deliver_event(self, sid, body):
++        service = self._subscriptions.get(sid)
++        if service is None:
++            logger.debug(f'GENA event for unknown SID {sid}')
++            return
++        state_vars = _parse_lastchange(body)
++        logger.debug(f'GENA event from {service}: {state_vars}')
++        if state_vars:
++            service._on_event(state_vars)
++
++    async def _run_event_server(self):
++        try:
++            self._event_server = await asyncio.start_server(
++                self._event_client, '0.0.0.0', 0)
++            self._event_port = self._event_server.sockets[0].getsockname()[1]
++            logger.info(f'GENA event server listening on port'
++                        f' {self._event_port}')
++            async with self._event_server:
++                await self._event_server.serve_forever()
++        except asyncio.CancelledError:
++            pass
++        except Exception as e:
++            log_exception(logger, f'GENA event server: {e!r}')
++
++    async def _event_client(self, reader, writer):
++        try:
++            req_line = await reader.readline()
++            if not req_line:
++                return
++            parts = req_line.decode('latin1').rstrip().split()
++            if len(parts) < 2:
++                return
++            method = parts[0]
++            headers = {}
++            while True:
++                line = await reader.readline()
++                if not line:
++                    return
++                line = line.decode('latin1').rstrip()
++                if not line:
++                    break
++                if ':' in line:
++                    k, v = line.split(':', 1)
++                    headers[k.strip().upper()] = v.strip()
++            content_length = int(headers.get('CONTENT-LENGTH', '0') or '0')
++            body = b''
++            if content_length:
++                body = await reader.readexactly(content_length)
++            if method == 'NOTIFY':
++                logger.debug(f'GENA NOTIFY received: SID={headers.get("SID")}'
++                             f' SEQ={headers.get("SEQ")}')
++                self._deliver_event(headers.get('SID'), body)
++            writer.write(b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n')
++            await writer.drain()
++        except (asyncio.IncompleteReadError, ConnectionError):
++            pass
++        except Exception as e:
++            log_exception(logger, f'GENA event client: {e!r}')
++        finally:
++            try:
++                writer.close()
++                await writer.wait_closed()
++            except (ConnectionError, OSError):
++                pass
++
+     async def get_notification(self):
+         """Return the tuple ('alive' or 'byebye', UPnPRootDevice instance).
+ 
+@@ -693,6 +901,18 @@
+         udn = root_device.udn
+         if udn in self._devices:
+             del self._devices[udn]
++            # local patch: drop any GENA subscriptions held by this device's
++            # services so their SIDs do not linger in the registry across the
++            # device's frequent byebye/reboot cycles.
++            for dev in UPnPDevice.embedded_devices_generator(root_device):
++                for service in dev.serviceList.values():
++                    sid = service.sid
++                    if sid is not None:
++                        service.sid = None
++                        if service._renew_task is not None:
++                            service._renew_task.cancel()
++                            service._renew_task = None
++                        self._subscriptions.pop(sid, None)
+             root_device.close()
+             logger.debug(f'{root_device} has been deleted')
+             self._put_notification('byebye', root_device)

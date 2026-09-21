@@ -1,6 +1,14 @@
---- a/pa_dlna.py	2026-09-20 17:50:55.166293755 +0300
-+++ b/pa_dlna.py	2026-09-20 18:26:37.121931627 +0300
-@@ -33,6 +33,16 @@
+--- a/pa_dlna.py
++++ b/pa_dlna.py
+@@ -19,6 +19,7 @@
+                    UPnPSoapFaultError, NL_INDENT, shorten,
+                    log_unhandled_exception, AsyncioTasks, QUEUE_CLOSED,
+                    xml_escape)
++from .upnp.network import UPnPInvalidHttpError
+ 
+ logger = logging.getLogger('pa-dlna')
+ 
+@@ -33,6 +34,16 @@
  # pulse event.
  NEW_SESSION_MAX_DELAY = 1
  ISSUE_48_TIMER = 2
@@ -17,16 +25,17 @@
  
  def get_udn(data):
      """Build an UPnP udn."""
-@@ -135,6 +145,8 @@
+@@ -135,6 +146,9 @@
          self.current_uri = None
          self.new_pulse_session = False
          self.suspended_state = False
 +        self.sink_corked = False        # local patch: source app paused state
 +        self.cork_keepalive_task = None # local patch: pause watchdog keepalive
++        self.event_restart_at = 0.0     # local patch: GENA event restart cooldown
          self.stream_sessions = StreamSessions(self)
          self.pulse_queue = asyncio.Queue()
  
-@@ -278,22 +290,39 @@
+@@ -278,22 +292,59 @@
  
          # Run an AVTransport action if needed.
          try:
@@ -59,7 +68,27 @@
                      return
 -                elif action == 'Stop':
 +                if self.encoder.track_metadata:
-+                    await self.set_nextavtransporturi(action, state)
++                    if self.supports_action('SetNextAVTransportURI'):
++                        await self.set_nextavtransporturi(action, state)
++                    else:
++                        # local patch: the renderer does not implement
++                        # SetNextAVTransportURI, and the only remaining way to
++                        # push the new metadata is SetAVTransportURI, which
++                        # forces a re-pull. On the CelMus DR70, closing the
++                        # current HTTP connection while the transport is
++                        # PLAYING makes it self-stop ~5 s later (a firmware
++                        # quirk: the old connection's EOF stops the whole
++                        # transport), so every track change caused an audible
++                        # play-7s/stop/restart cycle. The audio stream is a
++                        # live monitor stream and already carries the new
++                        # track, so skip the metadata push entirely and leave
++                        # the stream (and its connection) untouched: track
++                        # changes are then seamless. The trade-off is a stale
++                        # track title on the renderer display until the next
++                        # real stream (re)start.
++                        log_action(self.name, action, state, ignored=True,
++                                   msg='track change: no SetNextAVTransportURI'
++                                       ' support, keep streaming')
 +                return
 +            elif state not in ('STOPPED', 'NO_MEDIA_PRESENT'):
 +                if action == 'Stop':
@@ -76,7 +105,7 @@
          except UPnPSoapFaultError as e:
              arg = e.args[0]
              if (hasattr(arg, 'errorCode') and
-@@ -305,6 +334,30 @@
+@@ -305,6 +356,30 @@
  
          log_action(self.name, action, state, ignored=True)
  
@@ -107,7 +136,7 @@
      async def handle_pulse_event(self):
          """Handle a PulseAudio event.
  
-@@ -332,12 +385,96 @@
+@@ -332,12 +407,96 @@
                  if event == 'exit':
                      self.exit_metadata = self.sink_input_meta(
                                                      self.nullsink.sink_input)
@@ -204,7 +233,21 @@
              if self.nullsink.sink_input is None:
                  self.new_pulse_session = True
                  # The reconnection of a sink-input after an exit is signaled
-@@ -397,8 +534,19 @@
+@@ -394,11 +553,33 @@
+         service = self.upnp_device.serviceList[serviceId]
+         return await service.soap_action(action, args, log_debug=False)
+ 
++    def supports_action(self, action):
++        """Whether the AVTransport service advertises 'action'.
++
++        local patch: some renderers (e.g. the CelMus DR70) omit
++        SetNextAVTransportURI from their AVTransport actionList; calling it
++        then raises UPnPInvalidSoapError from soap_action(), which is not a
++        SOAP fault and would tear down the whole renderer.
++        """
++        service = self.upnp_device.serviceList.get(AVTRANSPORT)
++        return service is not None and action in service.actionList
++
      async def select_encoder(self, udn):
          """Select an encoder matching the DLNA device supported mime types."""
  
@@ -226,7 +269,7 @@
          res = select_encoder(self.control_point.config, self.name,
                               protocol_info, udn)
          if res is None:
-@@ -436,6 +584,14 @@
+@@ -436,6 +617,14 @@
      async def set_avtransporturi(self, metadata, state):
          await self.add_application()
  
@@ -241,7 +284,7 @@
          action = 'SetAVTransportURI'
          didl_lite = self.didl_lite_metadata(metadata)
          args = {'InstanceID': 0,
-@@ -488,6 +644,63 @@
+@@ -488,6 +677,71 @@
          #   changes.
          await asyncio.sleep(ISSUE_48_TIMER)
  
@@ -267,61 +310,133 @@
 +            # so the cork-resume path (which matches indices) may silently
 +            # skip it and the renderer stays paused while the user is
 +            # playing: no sound. Re-query the live transport state and bring
-+            # it in line with the adopted stream.
-+            if self.encoder.soap_minimum_interval != 0:
-+                await self.soap_spacer.wait()
-+            state = await self.get_transport_state()
-+            if (not self.stream_sessions.is_playing or
-+                    state in ('STOPPED', 'NO_MEDIA_PRESENT')):
-+                # The pull had already ended (or the renderer stopped / never
-+                # got a URI): (re)start it with a fresh
-+                # SetAVTransportURI + Play (handle_action restarts when the
-+                # HTTP stream is not running or the transport is stopped).
-+                cur_metadata = self.sink_input_meta(sink_input)
-+                if not cur_metadata.title:
-+                    cur_metadata = cur_metadata._replace(
-+                                        title=cur_metadata.publisher)
-+                logger.info(f'Streaming {sink_input.name} on {self.name}')
-+                await self.handle_action(cur_metadata)
-+            elif (state == 'PAUSED_PLAYBACK' and not self.sink_corked):
-+                # The source is playing but the renderer is paused (the
-+                # resume event was skipped because of the index change):
-+                # resume it, otherwise the device stays silent.
++            # it in line with the adopted stream. Transient SOAP/HTTP errors
++            # from a busy renderer (501 / empty header, frequent with the
++            # DR70 during its own resets) must not kill this task: the
++            # adopted stream is kept and the next pulse event reconciles.
++            try:
 +                if self.encoder.soap_minimum_interval != 0:
 +                    await self.soap_spacer.wait()
-+                log_action(self.name, 'Play', 'adopted stream')
-+                await self.play()
-+            elif (state == 'PLAYING' and self.sink_corked):
-+                # The source is paused but the renderer still plays: the
-+                # cork Pause was skipped for the same reason, and without it
-+                # digital silence keeps streaming. Pause the renderer.
-+                if self.encoder.soap_minimum_interval != 0:
-+                    await self.soap_spacer.wait()
-+                log_action(self.name, 'Pause', 'adopted corked stream')
-+                await self.soap_action(AVTRANSPORT, 'Pause',
-+                                       {'InstanceID': 0})
++                state = await self.get_transport_state()
++                if (not self.stream_sessions.is_playing or
++                        state in ('STOPPED', 'NO_MEDIA_PRESENT')):
++                    # The pull had already ended (or the renderer stopped /
++                    # never got a URI): (re)start it with a fresh
++                    # SetAVTransportURI + Play (handle_action restarts when
++                    # the HTTP stream is not running or the transport is
++                    # stopped).
++                    cur_metadata = self.sink_input_meta(sink_input)
++                    if not cur_metadata.title:
++                        cur_metadata = cur_metadata._replace(
++                                            title=cur_metadata.publisher)
++                    logger.info(f'Streaming {sink_input.name} on {self.name}')
++                    await self.handle_action(cur_metadata)
++                elif (state == 'PAUSED_PLAYBACK' and not self.sink_corked):
++                    # The source is playing but the renderer is paused (the
++                    # resume event was skipped because of the index change):
++                    # resume it, otherwise the device stays silent.
++                    if self.encoder.soap_minimum_interval != 0:
++                        await self.soap_spacer.wait()
++                    log_action(self.name, 'Play', 'adopted stream')
++                    await self.play()
++                elif (state == 'PLAYING' and self.sink_corked):
++                    # The source is paused but the renderer still plays: the
++                    # cork Pause was skipped for the same reason, and without
++                    # it digital silence keeps streaming. Pause the renderer.
++                    if self.encoder.soap_minimum_interval != 0:
++                        await self.soap_spacer.wait()
++                    log_action(self.name, 'Pause', 'adopted corked stream')
++                    await self.soap_action(AVTRANSPORT, 'Pause',
++                                           {'InstanceID': 0})
++            except (UPnPSoapFaultError, UPnPInvalidHttpError) as e:
++                logger.warning(f'{self.name}: transport reconcile at '
++                               f'maybe_stop() failed (transient): {e!r}')
 +            return
 +
          cur_index = self.get_sink_input_index()
          if cur_index is not None and cur_index != index:
              # A new track is being played.
-@@ -557,14 +770,50 @@
+@@ -506,7 +760,7 @@
+         log_action(self.name, 'Stop', state)
+         try:
+             await self.stop()
+-        except UPnPSoapFaultError:
++        except (UPnPSoapFaultError, UPnPInvalidHttpError):
+             pass
+ 
+     def set_current_uri(self):
+@@ -514,6 +768,42 @@
+                             f':{self.control_point.port}'
+                             f'{AUDIO_URI_PREFIX}/{self.upnp_device.UDN}')
+ 
++    async def subscribe_events(self):
++        """Subscribe to AVTransport event notifications (GENA).
++
++        local patch: the DR70 emits a LastChange event whenever its transport
++        state changes (e.g. a self-stop to STOPPED), which is detected here
++        instantly instead of on the next connection drop.
++        """
++        service = self.upnp_device.serviceList.get(AVTRANSPORT)
++        if service is None or service.eventSubURL is None:
++            return
++        try:
++            await service.subscribe(self.root_device._control_point.
++                                    _callback_url(),
++                                    listener=self._on_transport_event)
++            logger.debug(f'{self.name}: subscribed to AVTransport events')
++        except Exception as e:
++            logger.warning(f'{self.name}: cannot subscribe to AVTransport'
++                           f' events: {e!r}')
++
++    def _on_transport_event(self, state_vars):
++        state = state_vars.get('TransportState')
++        if not state:
++            return
++        logger.debug(f'{self.name}: AVTransport event -> {state}')
++        if (state == 'STOPPED' and self.stream_sessions.is_playing and
++                self.nullsink is not None and
++                self.nullsink.sink_input is not None and
++                not self.sink_corked):
++            now = asyncio.get_running_loop().time()
++            if now - self.event_restart_at >= 30:
++                self.event_restart_at = now
++                logger.info(f'{self.name}: renderer self-stopped (event),'
++                            f' restarting stream')
++                self.stream_sessions.is_playing = False
++                self.stream_sessions.schedule_restart(self)
++
+     @log_unhandled_exception(logger)
+     async def run(self):
+         """Run the Renderer task."""
+@@ -523,6 +813,9 @@
+             if not await self.select_encoder(self.upnp_device.UDN):
+                 return
+             self.set_current_uri()
++            # local patch: subscribe to AVTransport events so a renderer
++            # self-stop is detected immediately.
++            await self.subscribe_events()
+             level = (SYSTEMD_LOG_LEVEL if self.control_point.systemd else
+                                                                 logging.INFO)
+             logger.log(level, f"New '{self.name}' renderer with {self.encoder}"
+@@ -557,14 +850,53 @@
              # ever.
              test_end = self.control_point.test_end
              while test_end is None or not test_end.done():
 -                await self.handle_pulse_event()
 +                try:
 +                    await self.handle_pulse_event()
-+                except UPnPSoapFaultError as e:
++                except (UPnPSoapFaultError, UPnPInvalidHttpError) as e:
 +                    # local patch: renderers such as the CelMus DR70 briefly
-+                    # answer SOAP actions with an error (501) during their
-+                    # own internal resets. Tearing the renderer down here
-+                    # unloads the null-sink and kills the running pipeline,
-+                    # which turned every momentary blip into minutes of dead
-+                    # air. Keep the renderer and its null-sink registered and
-+                    # retry on the next event/discovery cycle instead: the
-+                    # DR70 keeps re-pulling the current URI, so an
-+                    # established stream simply keeps flowing.
++                    # answer SOAP actions with an error (501) or an empty/
++                    # malformed HTTP response during their own internal
++                    # resets. Tearing the renderer down here unloads the
++                    # null-sink and kills the running pipeline, which turned
++                    # every momentary blip into ~30 s of dead air (unload +
++                    # rediscovery + re-pull). Keep the renderer and its
++                    # null-sink registered and retry on the next
++                    # event/discovery cycle instead: the DR70 keeps re-pulling
++                    # the current URI, so an established stream simply keeps
++                    # flowing.
 +                    logger.error(f'{e!r}')
 +                    await asyncio.sleep(SOAP_RETRY_DELAY)
 +                    # The pulse event that raised the fault has already
@@ -340,7 +455,8 @@
 +                                metadata = metadata._replace(
 +                                            title=metadata.publisher)
 +                            await self.handle_action(metadata)
-+                    except UPnPSoapFaultError as e2:
++                    except (UPnPSoapFaultError,
++                            UPnPInvalidHttpError) as e2:
 +                        logger.error(f'retry after SOAP fault: {e2!r}')
 +                    except Exception as e2:
 +                        logger.warning(f'cannot retry after SOAP fault:'
