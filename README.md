@@ -315,3 +315,13 @@ pactl set-default-sink "CelCast-uuid:85f70b2d-3c72-501f-a172-07bbc058d793"
 |---------------|-------------------|----------------------------|
 | 192.168.31.245 | CelMusper DR70  | DLNA renderer (CelCast)   |
 | 192.168.31.194 | NVIDIA tegra     | Chromecast/DIAL only — ignore |
+
+## Support
+
+Enjoying this project? A small donation is greatly appreciated and helps keep it going:
+
+<p align="center">
+  <a href="https://www.paypal.me/antoxab1978" target="_blank">
+    <img src="https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif" alt="Donate with PayPal" />
+  </a>
+</p>
