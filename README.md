@@ -3,8 +3,9 @@
 Forward this PC's audio (PipeWire/PulseAudio) to a **DLNA renderer** on the LAN —
 setup for the **CelMusper DR70** (CelCast) which the machine runs in DLNA mode.
 
-Built on `pa-dlna` (Debian) + a handful of targeted fixes that make it
-reliable with consumer renderers like the DR70.
+Built on `pa-dlna` (the Debian package on Debian/LMDE, the `pa-dlna==1.0`
+PyPI release via pipx on Ubuntu/Mint) + a handful of targeted fixes that make
+it reliable with consumer renderers like the DR70.
 
 ## Layout
 
@@ -12,7 +13,7 @@ reliable with consumer renderers like the DR70.
 Pc2Dlna/
 ├── install.sh          # one-shot bootstrap (idempotent)
 ├── files/
-│   ├── pa-dlna.conf                     # lossless-first encoder selection (FLAC primary)
+│   ├── pa-dlna.conf                     # lossless-first encoder selection (LPCM primary)
 │   ├── pa-dlna.service                  # user systemd unit (autostart, -m 15 msearch)
 │   └── pipewire-bitperfect-44100.conf   # PipeWire graph pinned to 44.1 kHz
 └── patches/
@@ -30,27 +31,41 @@ Pc2Dlna/
 ./install.sh wlp3s0     # e.g. for the wifi on the LMDE laptop
 ```
 
+The runtime is installed differently per distro (detected automatically):
+**Debian/LMDE** package `pa-dlna` in apt, while **Ubuntu/Mint** do not package
+it and block `pip install --user` (PEP 668) — there the runtime comes from PyPI
+via pipx, pinned to `pa-dlna==1.0` because `patches/` target that exact source
+version (Debian `pa-dlna 1.0-1`).
+
 What it does:
 
-1. `apt install pa-dlna pavucontrol` (if missing).
-2. Copies the *pristine* system `pa_dlna` package into the Python **user site**
-   and applies `patches/*.patch` to it. A stamp file records the pa-dlna version
-   and the patch checksum: re-runs are no-ops while both are unchanged, and
-   after an `apt upgrade` of pa-dlna (or a patch edit) the copy is rebuilt from
-   the new pristine package (the old one is moved aside as
-   `pa_dlna.disabled-<date>`). A patch that no longer applies aborts the install
-   with an error instead of leaving a half-patched copy.
-   If the `pc2dlna` `.deb` is installed, no user-site copy is made (it would
-   shadow the `.deb`); an existing one is moved aside.
+1. Installs the runtime:
+   - *Debian/LMDE*: `apt install pa-dlna pavucontrol` (if missing).
+   - *Ubuntu/Mint*: installs `pipx` (if missing), then
+     `pipx install --force pa-dlna==1.0`.
+2. Applies `patches/*.patch` to a private copy of the package and writes a
+   stamp file (pa-dlna version + patch checksum). Re-runs are no-ops while both
+   are unchanged; after a runtime upgrade or a patch edit the copy is rebuilt
+   from the pristine source, and a patch that no longer applies aborts the
+   install instead of leaving a half-patched copy.
+   - *Debian/LMDE*: the copy is the Python **user site** (rebuilds on
+     `apt upgrade` of pa-dlna; the old one is moved aside as
+     `pa_dlna.disabled-<date>`). If the `pc2dlna` `.deb` is installed, no
+     user-site copy is made (it would shadow the `.deb`); an existing one is
+     moved aside.
+   - *Ubuntu/Mint*: the pipx venv itself is reinstalled and patched
+     (`~/.local/share/pipx/venvs/pa-dlna`).
 3. Writes `~/.config/pa-dlna/pa-dlna.conf` with lossless-first encoding.
 4. Writes the PipeWire drop-in `~/.config/pipewire/pipewire.conf.d/40-bitperfect-44100.conf`
    and **restarts PipeWire** (audio is interrupted for a few seconds) — only when
    the file is new or changed. `PC2DLNA_NO_PIPEWIRE=1 ./install.sh` skips this
    step entirely.
-5. Installs + enables `~/.config/systemd/user/pa-dlna.service`. The network
-   interface is fixed in the unit (`-n <nic>`); if none is detected the option is
-   omitted and pa-dlna uses all interfaces. Re-run `install.sh` if the interface
-   changes (e.g. wifi → ethernet).
+5. Installs + enables `~/.config/systemd/user/pa-dlna.service` (`ExecStart` is
+   the detected pa-dlna binary: `/usr/bin/pa-dlna` on Debian, the pipx venv
+   binary on Ubuntu/Mint). The network interface is fixed in the unit
+   (`-n <nic>`); if none is detected the option is omitted and pa-dlna uses all
+   interfaces. Re-run `install.sh` if the interface changes (e.g. wifi →
+   ethernet).
 
 ### Debian package
 
@@ -63,6 +78,13 @@ the user unit and examples; the PipeWire drop-in and `pa-dlna.conf` are in
 `install.sh` run shadows the package: `postinst` warns about it, and
 `install.sh` moves it aside.
 
+`build_deb.sh` uses the Debian `pa-dlna` package as its pristine source when
+present and falls back to the pinned PyPI release (`pa-dlna==1.0`) otherwise,
+so it also builds on Ubuntu/Mint; the resulting `.deb` still needs a system
+with `pa-dlna` in apt (Debian/LMDE) to install — on Ubuntu/Mint use
+`install.sh`'s pipx mode instead. The Python flavor is selected with
+`PYVER=python3.<minor> ./build_deb.sh` (default: the local `python3`).
+
 ## Usage
 
 - `pavucontrol` → *Output Devices*: the `DR70 - 85f7…` sink *is* the renderer.
@@ -71,7 +93,8 @@ the user unit and examples; the PipeWire drop-in and `pa-dlna.conf` are in
 - The DR70 must be set to its **DLNA input mode** or it answers every UPnP action
   with HTTP 501 and nothing plays.
 - The PipeWire graph is pinned to 44.1 kHz (see *Audio fidelity* below), and the
-  stream is sent as 44.1 kHz FLAC.
+  stream is sent as 44.1 kHz lossless LPCM (WAV) by default; FLAC is one line
+  in `pa-dlna.conf` away (see fix #18).
 
 ## Audio fidelity / bit-perfect
 
@@ -82,7 +105,7 @@ The chain on this machine:
 
 ```
 radio/player app (44.1k) --PipeWire graph (float32 44.1k)--> null-sink
-    -> monitor -> parec (s16le 44.1k) -> ffmpeg (FLAC 44.1k) -> DR70
+    -> monitor -> parec (s16le 44.1k) -> ffmpeg (LPCM 44.1k) -> DR70
 ```
 
 Three things make this possible:
@@ -295,12 +318,59 @@ pactl set-default-sink "CelCast-uuid:85f70b2d-3c72-501f-a172-07bbc058d793"
     `UPnPInvalidHttpError` like a transient SOAP fault (log, back off, replay
     the pulse state; never unload the sink), and the `maybe_stop()` transport
     reconcile is guarded so a flaky response cannot kill that task either.
+18. **Kodi DMR interop** (`http_server.py`, `pa_dlna.py`): the Kodi 22.0-BETA1
+    renderer (SHIELD Android TV) does three things stock pa-dlna mishandles:
+    (a) it probes the stream URL with a `?mimetype=audio%2fflac` query, which
+    failed the exact-path `match()` and answered 404 on every playback start;
+    (b) it re-opens the stream URL while the first connection is still active
+    (probe-then-playback), which the 409 "already running" rejection made it
+    treat as fatal — now a GET arriving while a track runs restarts just the
+    encoder so the new connection gets a fresh stream with a valid header,
+    instead of rejecting it; and (c) a source-app metadata update took the
+    gapless `SetNextAVTransportURI` path (the action is advertised), whose
+    local `stop_track()` closes the very connection the renderer is pulling
+    — Kodi then stops its transport instead of advancing, and every song
+    title update became a play/stop/restart cycle. Since pa-dlna tracks are
+    always the same single live URL, that SOAP is now skipped for **every**
+    renderer (the DR70 skip of #16 became unconditional), keeping the stream
+    seamless at the cost of a stale title on the renderer display. And
+    (d) **Kodi stops live FLAC streams**: even with all of the above fixed
+    and a valid stream (865 kbps, `flac -t` clean, no silence in the
+    source), Kodi 22.0-BETA1 aborts playback every ~10-40 s mid-track while
+    the same hours-long LPCM (L16) stream plays without a single hiccup
+    (verified with `GetPositionInfo` advancing across many minutes). The
+    default encoder selection is therefore LPCM-first (`FFMpegL16WavEncoder`):
+    equally lossless and bit-perfect, `audio/L16` is a mandatory DLNA format,
+    and its ~45% higher bandwidth is irrelevant on a LAN (FLAC stays one
+    selection line away in `files/pa-dlna.conf` for renderers that prefer
+    it).
 
 ## Troubleshooting
 
 - **No sink appears**: DR70 in DLNA mode? `journalctl --user -u pa-dlna -f` shows
   `Disable the ... (re-enabling on next discovery)` blips — normal and
   self-healing.
+- **DR70 missing from `pactl list short sinks`**: the renderer is off or off
+  the network (it does not answer ping). pa-dlna rediscovers every 15 s; once
+  found, a sink named `<friendly name>-uuid:<udn>` appears. On the pipx install
+  the `pa-dlna` command lives in `~/.local/bin` (the service uses the absolute
+  path, so PATH does not matter for it).
+- **Kodi renderer stops after ~10-40 s (play/stop/restart loop)**: two
+  distinct causes, both fixed in this patch set. (a) HTTP-level: Kodi probes
+  the URL with `?mimetype=...`, re-opens the stream while the first
+  connection is still active, and aborts on a 409 — all handled now. (b) Kodi
+  22.0-BETA1 aborts live **FLAC** streams mid-track (its streaming-FLAC
+  handling is broken in this build) — the default encoder is LPCM (L16),
+  which plays indefinitely; services using FLAC (older confs) should put
+  `FFMpegL16WavEncoder` first in `~/.config/pa-dlna/pa-dlna.conf`. It also
+  aborts on ~7 s of perfectly silent stream (silence compresses to a nearly
+  empty FLAC that reads like a stalled stream) — sources with long silent
+  stretches can still trip it, while the DR70 (which streams silence
+  happily) is unaffected.
+- **Everything on this PC is routed to the renderer**: with the renderer sink
+  set as the system default (or a per-app route), every UI/notification sound
+  starts and stops streams. That is expected; route only your music player if
+  you want the renderer quiet otherwise.
 - **Constant `missing "LOCATION"` warnings**: that's the DR70's proprietary SSDP
   announce (`CelMusperOS`, `X-CUSTOM-KEY`), harmless noise.
 - **Choppy streams**: check DR70 WiFi/UPnP stability; a drop now only costs a few

@@ -1,5 +1,5 @@
---- a/pa_dlna.py
-+++ b/pa_dlna.py
+--- a/pa_dlna.py	2026-10-13 19:22:25.007236916 +0300
++++ b/pa_dlna.py	2026-10-13 19:22:25.010353038 +0300
 @@ -19,6 +19,7 @@
                     UPnPSoapFaultError, NL_INDENT, shorten,
                     log_unhandled_exception, AsyncioTasks, QUEUE_CLOSED,
@@ -35,7 +35,17 @@
          self.stream_sessions = StreamSessions(self)
          self.pulse_queue = asyncio.Queue()
  
-@@ -278,22 +292,59 @@
+@@ -213,6 +227,9 @@
+             return False
+ 
+     def match(self, uri_path):
++        # local patch: some renderers (Kodi) probe the stream URL with a
++        # '?mimetype=...' query appended; strip it so the probe matches.
++        uri_path = uri_path.split('?', 1)[0]
+         return uri_path == f'{AUDIO_URI_PREFIX}/{self.upnp_device.UDN}'
+ 
+     async def add_application(self):
+@@ -278,22 +295,56 @@
  
          # Run an AVTransport action if needed.
          try:
@@ -68,27 +78,24 @@
                      return
 -                elif action == 'Stop':
 +                if self.encoder.track_metadata:
-+                    if self.supports_action('SetNextAVTransportURI'):
-+                        await self.set_nextavtransporturi(action, state)
-+                    else:
-+                        # local patch: the renderer does not implement
-+                        # SetNextAVTransportURI, and the only remaining way to
-+                        # push the new metadata is SetAVTransportURI, which
-+                        # forces a re-pull. On the CelMus DR70, closing the
-+                        # current HTTP connection while the transport is
-+                        # PLAYING makes it self-stop ~5 s later (a firmware
-+                        # quirk: the old connection's EOF stops the whole
-+                        # transport), so every track change caused an audible
-+                        # play-7s/stop/restart cycle. The audio stream is a
-+                        # live monitor stream and already carries the new
-+                        # track, so skip the metadata push entirely and leave
-+                        # the stream (and its connection) untouched: track
-+                        # changes are then seamless. The trade-off is a stale
-+                        # track title on the renderer display until the next
-+                        # real stream (re)start.
-+                        log_action(self.name, action, state, ignored=True,
-+                                   msg='track change: no SetNextAVTransportURI'
-+                                       ' support, keep streaming')
++                    # local patch: skip the SetNextAVTransportURI path for
++                    # every renderer, even those that DO implement the action
++                    # (e.g. the Kodi 22.0-BETA1 DMR on the SHIELD). The "next
++                    # URI" is the same single live URL, so pushing it while
++                    # the transport is PLAYING brings nothing: the local
++                    # stop_track() closes the HTTP connection the renderer is
++                    # pulling, and the renderer then stops its transport
++                    # instead of advancing (Kodi goes STOPPED and pa-dlna
++                    # restarts it, producing a play-10s/stop/restart cycle on
++                    # every source-app metadata update). The audio stream is
++                    # a live monitor stream and already carries the new
++                    # track, so leave the stream (and its connection)
++                    # untouched: track changes are flawless. The trade-off is
++                    # a stale track title on the renderer display until the
++                    # next real stream (re)start.
++                    log_action(self.name, action, state, ignored=True,
++                               msg='track change: skip SetNextAVTransportURI'
++                                   ' (single live URL), keep streaming')
 +                return
 +            elif state not in ('STOPPED', 'NO_MEDIA_PRESENT'):
 +                if action == 'Stop':

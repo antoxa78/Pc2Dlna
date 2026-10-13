@@ -16,7 +16,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE=pc2dlna
-VERSION=1.17
+VERSION=1.18
 BUILD_DIR="$PROJECT_DIR/build"
 ROOT="$BUILD_DIR/${PACKAGE}_${VERSION}"
 DEB="$BUILD_DIR/Pc2Dlna_${VERSION}_all.deb"
@@ -29,21 +29,46 @@ echo ">> python library dir: $PYLIB"
 # Source of the modules: the PRISTINE system pa_dlna ('-s' ignores the user
 # site), with patches/ applied here. The package is therefore always exactly
 # 'system pa_dlna + patches/', independent of any hand-edited or stale copy in
-# ~/.local.
+# ~/.local. On Ubuntu/Mint apt does not ship pa-dlna, so when no system copy
+# exists the pristine source is the pinned PyPI release that patches/ target.
+PADLNA_PIP_VER=1.0     # keep in sync with install.sh
+FROM_PYPI=0
 SRC_PKG="$(/usr/bin/python3 -s -c 'import os, pa_dlna; print(os.path.dirname(pa_dlna.__file__))' 2>/dev/null || true)"
 if [ -z "$SRC_PKG" ] || [ ! -d "$SRC_PKG" ]; then
     for d in /usr/lib/python3*/dist-packages/pa_dlna; do
         [ -d "$d" ] && SRC_PKG="$d" && break
     done
 fi
-[ -d "${SRC_PKG:-}" ] || { echo "ERROR: cannot resolve the system pa_dlna package dir" >&2; exit 1; }
+if [ -z "${SRC_PKG:-}" ] || [ ! -d "$SRC_PKG" ]; then
+    echo ">> no system pa_dlna; fetching pristine PyPI pa-dlna==$PADLNA_PIP_VER"
+    SRC_TGZ="$BUILD_DIR/pa_dlna-$PADLNA_PIP_VER.tar.gz"
+    if [ ! -f "$SRC_TGZ" ]; then
+        SRC_URL="$(curl -fsSL "https://pypi.org/pypi/pa-dlna/$PADLNA_PIP_VER/json" |
+            /usr/bin/python3 -c 'import json, sys
+for u in json.load(sys.stdin)["urls"]:
+    if u["packagetype"] == "sdist":
+        print(u["url"])
+        break')"
+        [ -n "$SRC_URL" ] || { echo "ERROR: cannot find the pa-dlna $PADLNA_PIP_VER sdist on PyPI" >&2; exit 1; }
+        curl -fsSL "$SRC_URL" -o "$SRC_TGZ"
+    fi
+    rm -rf "$BUILD_DIR/pa_dlna-$PADLNA_PIP_VER"
+    tar -xzf "$SRC_TGZ" -C "$BUILD_DIR"
+    SRC_PKG="$BUILD_DIR/pa_dlna-$PADLNA_PIP_VER/pa_dlna"
+    FROM_PYPI=1
+fi
+[ -d "${SRC_PKG:-}" ] || { echo "ERROR: cannot resolve the pristine pa_dlna package dir" >&2; exit 1; }
 if grep -rqs 'local patch' --include='*.py' "$SRC_PKG"; then
     echo "ERROR: $SRC_PKG is already patched (is the pc2dlna .deb installed?)." >&2
-    echo "       Build from a pristine pa-dlna: remove pc2dlna and reinstall pa-dlna." >&2
+    echo "       Build from a pristine pa-dlna." >&2
     exit 1
 fi
-PADLNA_VER="$(dpkg-query -W -f='${Version}' pa-dlna 2>/dev/null || true)"
-echo ">> pristine pa_dlna ${PADLNA_VER:-?} from: $SRC_PKG"
+if [ "$FROM_PYPI" = 1 ]; then
+    PADLNA_VER="$PADLNA_PIP_VER"
+else
+    PADLNA_VER="$(dpkg-query -W -f='${Version}' pa-dlna 2>/dev/null || true)"
+fi
+echo ">> pristine pa_dlna ${PADLNA_VER:-?}$([ "$FROM_PYPI" = 1 ] && echo ' (PyPI)') from: $SRC_PKG"
 
 PYMINOR="${PYVER#python3.}"
 
@@ -132,10 +157,12 @@ EOF
 # --- control ------------------------------------------------------------------
 # The whole pa_dlna package is replaced, so it must match the pa-dlna version
 # it was copied from; and it only lives in this Python minor version's dir.
-if [ -n "$PADLNA_VER" ]; then
+if [ -n "$PADLNA_VER" ] && [ "$FROM_PYPI" = 0 ]; then
     PADLNA_DEP="pa-dlna (= $PADLNA_VER)"
 else
-    PADLNA_DEP="pa-dlna (>= 1.0)"
+    # Built from the PyPI source: the Debian revision is unknown, so accept
+    # any 1.0 packaging.
+    PADLNA_DEP="pa-dlna (>= ${PADLNA_VER:-1.0})"
 fi
 cat > "$ROOT/DEBIAN/control" <<EOF
 Package: $PACKAGE
@@ -187,13 +214,23 @@ Description: Stream PC audio to DLNA renderers with reliability fixes
      are treated like SOAP faults in the event loop and maybe_stop() — logged,
      backed off and retried — instead of tearing the renderer down for a
      ~30 s rediscovery cycle.
+   * Kodi DMR interop: Kodi probes the stream URL with a '?mimetype=...'
+     query term and re-opens it while the first connection is still active
+     (probe then playback); the probe is now answered and a re-pull restarts
+     the encoder for a fresh stream instead of being refused with a 409. The
+     SetNextAVTransportURI metadata push is skipped for every renderer — for
+     a single live URL it only closed the connection the renderer was
+     pulling — and the default encoder selection is LPCM (L16): Kodi
+     22.0-BETA1 aborts live FLAC streams mid-track, LPCM plays indefinitely
+     (both formats are lossless).
  .
  Requires the exact pa-dlna version (and Python minor version) the modules were
  built against; rebuild the package after upgrading either.
  .
  Depends are satisfied on most systems by: pa-dlna, ffmpeg, a Pulse server
  (pipewire-pulse or pulseaudio) and pavucontrol for routing apps to the
- renderer sink.
+ renderer sink. On Ubuntu/Mint (no pa-dlna in apt) use install.sh instead,
+ which installs the pinned PyPI release with pipx.
  .
  It also installs a user systemd unit to run the daemon with fast (15 s)
  msearch re-discovery:

@@ -1,5 +1,5 @@
---- a/http_server.py	2026-09-20 17:50:55.168417411 +0300
-+++ b/http_server.py	2026-09-20 18:35:08.866163867 +0300
+--- a/http_server.py	2026-10-13 18:51:09.525819599 +0300
++++ b/http_server.py	2026-10-13 18:51:09.530162963 +0300
 @@ -13,6 +13,21 @@
  
  logger = logging.getLogger('http')
@@ -205,3 +205,29 @@
          self.is_playing = True
          # Start the subprocesses.
          if self.processes is None:
+@@ -492,10 +637,21 @@
+                     await renderer.disable_root_device()
+                     break
+                 if renderer.stream_sessions.is_playing:
+-                    handler.send_error(HTTPStatus.CONFLICT,
+-                                       f'Cannot start {renderer.name} stream'
+-                                       f' (already running)')
+-                    break
++                    if handler.command == 'HEAD':
++                        # local patch: a HEAD probe while a track is running
++                        # must not disturb the stream (Kodi probes the URL).
++                        await write_http_ok(writer, renderer)
++                        return
++                    # local patch: some renderers (Kodi) re-open the stream
++                    # URL while the first connection is still active (probe
++                    # then playback); refusing the new GET with a 409 makes
++                    # the renderer give up and stop. Restart just the encoder
++                    # so the new connection gets a fresh stream with a valid
++                    # header, and let the old connection die.
++                    logger.info(f'{renderer.name}: renderer re-pulled while'
++                                f' a track is running, restarting the encoder'
++                                f' for a fresh stream')
++                    await renderer.stream_sessions.stop_track()
+                 if renderer.nullsink is None:
+                     handler.send_error(HTTPStatus.CONFLICT,
+                                        f'{renderer.name} temporarily disabled')
