@@ -16,7 +16,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE=pc2dlna
-VERSION=1.18
+VERSION=1.19
 BUILD_DIR="$PROJECT_DIR/build"
 ROOT="$BUILD_DIR/${PACKAGE}_${VERSION}"
 DEB="$BUILD_DIR/Pc2Dlna_${VERSION}_all.deb"
@@ -220,9 +220,10 @@ Description: Stream PC audio to DLNA renderers with reliability fixes
      the encoder for a fresh stream instead of being refused with a 409. The
      SetNextAVTransportURI metadata push is skipped for every renderer — for
      a single live URL it only closed the connection the renderer was
-     pulling — and the default encoder selection is LPCM (L16): Kodi
-     22.0-BETA1 aborts live FLAC streams mid-track, LPCM plays indefinitely
-     (both formats are lossless).
+     pulling — and the default encoder is the raw big-endian L16Encoder:
+     Kodi 22.0-BETA1 aborts live FLAC streams mid-track and force-decodes
+     audio/L16 as raw big-endian PCM, so the container-less L16 stream is
+     exactly what it expects (lossless, ~1.4 Mbps on LAN).
  .
  Requires the exact pa-dlna version (and Python minor version) the modules were
  built against; rebuild the package after upgrading either.

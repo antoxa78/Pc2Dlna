@@ -336,14 +336,19 @@ pactl set-default-sink "CelCast-uuid:85f70b2d-3c72-501f-a172-07bbc058d793"
     seamless at the cost of a stale title on the renderer display. And
     (d) **Kodi stops live FLAC streams**: even with all of the above fixed
     and a valid stream (865 kbps, `flac -t` clean, no silence in the
-    source), Kodi 22.0-BETA1 aborts playback every ~10-40 s mid-track while
-    the same hours-long LPCM (L16) stream plays without a single hiccup
-    (verified with `GetPositionInfo` advancing across many minutes). The
-    default encoder selection is therefore LPCM-first (`FFMpegL16WavEncoder`):
-    equally lossless and bit-perfect, `audio/L16` is a mandatory DLNA format,
-    and its ~45% higher bandwidth is irrelevant on a LAN (FLAC stays one
-    selection line away in `files/pa-dlna.conf` for renderers that prefer
-    it).
+    source), Kodi 22.0-BETA1 aborts playback every ~10-40 s mid-track. Its
+    demuxer **force-selects the raw `s16be` decoder whenever the content
+    type starts with `audio/l16`** (hardcoded in its source), so a PCM
+    stream must be raw **big-endian**: the WAV-container
+    `FFMpegL16WavEncoder` output (little-endian payload) is byte-swapped
+    into audible noise by that same forced demuxer. The default encoder is
+    therefore `L16Encoder`: container-less raw s16be
+    (`audio/L16;rate=44100;channels=2`, RFC 2586), exactly what Kodi
+    expects, and it plays indefinitely (verified with `GetPositionInfo`
+    advancing across many minutes). LPCM is equally lossless and
+    bit-perfect, `audio/L16` is a mandatory DLNA format, and its ~45% higher
+    bandwidth is irrelevant on a LAN. FLAC stays one selection line away in
+    `files/pa-dlna.conf` for renderers that prefer it.
 
 ## Troubleshooting
 
@@ -359,14 +364,15 @@ pactl set-default-sink "CelCast-uuid:85f70b2d-3c72-501f-a172-07bbc058d793"
   distinct causes, both fixed in this patch set. (a) HTTP-level: Kodi probes
   the URL with `?mimetype=...`, re-opens the stream while the first
   connection is still active, and aborts on a 409 — all handled now. (b) Kodi
-  22.0-BETA1 aborts live **FLAC** streams mid-track (its streaming-FLAC
-  handling is broken in this build) — the default encoder is LPCM (L16),
-  which plays indefinitely; services using FLAC (older confs) should put
-  `FFMpegL16WavEncoder` first in `~/.config/pa-dlna/pa-dlna.conf`. It also
-  aborts on ~7 s of perfectly silent stream (silence compresses to a nearly
-  empty FLAC that reads like a stalled stream) — sources with long silent
-  stretches can still trip it, while the DR70 (which streams silence
-  happily) is unaffected.
+  22.0-BETA1 aborts live **FLAC** streams mid-track, and force-decodes
+  anything announced as `audio/L16` as raw **big-endian** PCM: the default
+  `L16Encoder` (raw s16be) plays indefinitely, while FLAC and the
+  WAV-container variant do not. Older confs on FLAC should select
+  `L16Encoder` first in `~/.config/pa-dlna/pa-dlna.conf`. Kodi also aborts
+  on ~7 s of a perfectly silent **FLAC** stream (compressed silence has
+  near-zero throughput that reads like a stalled stream); raw PCM has a
+  constant byte rate so it is not affected, and the DR70 (which streams
+  silence happily) never was.
 - **Everything on this PC is routed to the renderer**: with the renderer sink
   set as the system default (or a per-app route), every UI/notification sound
   starts and stops streams. That is expected; route only your music player if
