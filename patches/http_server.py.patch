@@ -1,5 +1,5 @@
---- a/http_server.py	2026-10-13 18:51:09.525819599 +0300
-+++ b/http_server.py	2026-10-13 18:51:09.530162963 +0300
+--- a/http_server.py	2026-10-13 20:09:23.111916845 +0300
++++ b/http_server.py	2026-10-13 20:09:23.113673749 +0300
 @@ -13,6 +13,21 @@
  
  logger = logging.getLogger('http')
@@ -37,7 +37,36 @@
              try:
                  writer.close()
                  await writer.wait_closed()
-@@ -147,9 +168,11 @@
+@@ -114,6 +135,8 @@
+         """Write to the StreamWriter what is read from a subprocess stdout."""
+ 
+         logger = logging.getLogger('writer')
++        total = 0
++        first = True
+         while True:
+             partial_data = False
+             if self.writer.is_closing():
+@@ -125,12 +148,18 @@
+                 data = e.partial
+                 partial_data = True
+             if data:
++                if first:
++                    logger.debug(f'{self.task_name}: first bytes'
++                                 f' {data[:16].hex(" ")}')
++                    first = False
++                total += len(data)
+                 self.writer.write(f'{len(data):x}\r\n'.encode())
+                 self.writer.write(data)
+                 self.writer.write('\r\n'.encode())
+                 await self.writer.drain()
+             if not data or partial_data:
+-                logger.debug(f'EOF reading from pipe on {self.task_name}')
++                logger.debug(f'EOF reading from pipe on {self.task_name}'
++                             f' (wrote {total} bytes)')
+                 break
+ 
+     @log_unhandled_exception(logger)
+@@ -147,9 +176,11 @@
                                                    name='shutdown')
          except ConnectionError as e:
              logger.error(f'{self.task_name} HTTP socket is closed: {e!r}')
@@ -52,7 +81,7 @@
          except Exception:
              await self.session.close_session(shutdown_coro=True)
              raise
-@@ -294,7 +317,35 @@
+@@ -294,7 +325,35 @@
          exit_status = ret if ret >= 0 else signal.strsignal(-ret)
          logger.info(f'Exit status of parec process: {exit_status}')
          if exit_status in (0, 'Killed', 'Terminated'):
@@ -88,7 +117,7 @@
              return
  
          await self.close(disable=True)
-@@ -386,8 +437,100 @@
+@@ -386,8 +445,100 @@
          self.track = None
          self.track_count = 0
          self.stream_tasks = AsyncioTasks()
@@ -189,7 +218,7 @@
          self.is_playing = False
          if self.track is not None:
              try:
-@@ -398,6 +541,7 @@
+@@ -398,6 +549,7 @@
              await self.processes.close_encoder()
  
      async def close_session(self, shutdown_coro=False):
@@ -197,7 +226,7 @@
          self.is_playing = False
          self.track_count = 0
          if self.track is not None:
-@@ -413,6 +557,7 @@
+@@ -413,10 +565,21 @@
              self.processes = None
  
      async def start_track(self, writer):
@@ -205,7 +234,21 @@
          self.is_playing = True
          # Start the subprocesses.
          if self.processes is None:
-@@ -492,10 +637,21 @@
+             self.processes = StreamProcesses(self)
++        else:
++            # local patch: a renderer that (re)opens the stream URL must
++            # receive a stream that starts at its beginning, container header
++            # included -- Kodi probes the URL, closes, then opens the real
++            # playback connection, and without the header its demuxer cannot
++            # detect the container (and the channels/rate inside it). Killing
++            # just the encoder keeps parec warm: the new encoder restarts the
++            # container from byte 0. For the container-less encoders
++            # (L16Encoder) this is a no-op.
++            await self.processes.close_encoder()
+         await self.processes.run()
+ 
+         # Get the reader from the last subprocess on the pipe chain.
+@@ -492,10 +655,21 @@
                      await renderer.disable_root_device()
                      break
                  if renderer.stream_sessions.is_playing:

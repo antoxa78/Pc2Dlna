@@ -1,0 +1,13 @@
+--- a/encoders.py	2026-10-13 20:09:23.103521882 +0300
++++ b/encoders.py	2026-10-13 20:09:23.106641994 +0300
+@@ -326,7 +326,9 @@
+     container = 'aiff'
+ 
+     def __init__(self):
+-        super().__init__(['audio/aiff'])
++        # local patch: Kodi (and other renderers) advertise the Aiff
++        # container as 'audio/x-aiff'; accept both spellings.
++        super().__init__(['audio/aiff', 'audio/x-aiff'])
+ 
+ class FFMpegFlacEncoder(FFMpegEncoder):
+     """Lossless Flac encoder.
