@@ -85,6 +85,30 @@ with `pa-dlna` in apt (Debian/LMDE) to install — on Ubuntu/Mint use
 `install.sh`'s pipx mode instead. The Python flavor is selected with
 `PYVER=python3.<minor> ./build_deb.sh` (default: the local `python3`).
 
+### Releases & verification
+
+Each release is published on GitHub with the built `.deb` and a GPG-signed
+`SHA256SUMS`. The `v*` git tags are GPG-signed annotated tags, so the release
+can be verified end to end.
+
+Signing key (`Pc2Dlna release signing`), also committed as [`KEY.asc`](KEY.asc):
+
+```
+48AD C229 1BE0 1810 3C3C  36AF 8D5D 631F 7C00 C8F7
+```
+
+Verify a downloaded release:
+
+```sh
+# 1. the signed tag (from a clone of the repo)
+git verify-tag v1.21
+
+# 2. the .deb against the signed checksums
+gpg --import KEY.asc
+gpg --verify SHA256SUMS.asc SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
 ## Usage
 
 - `pavucontrol` → *Output Devices*: the `DR70 - 85f7…` sink *is* the renderer.

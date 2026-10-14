@@ -16,7 +16,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE=pc2dlna
-VERSION=1.20
+VERSION=1.21
 BUILD_DIR="$PROJECT_DIR/build"
 ROOT="$BUILD_DIR/${PACKAGE}_${VERSION}"
 DEB="$BUILD_DIR/Pc2Dlna_${VERSION}_all.deb"
